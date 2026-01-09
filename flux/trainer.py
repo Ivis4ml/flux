@@ -172,6 +172,9 @@ class FluxTrainer:
 
         Must be called before fit() or training_loop().
         Can be called explicitly for more control over initialization timing.
+
+        Handles notebook environments (Jupyter) gracefully by detecting
+        existing event loops and using appropriate patterns.
         """
         if self._initialized:
             return
@@ -186,14 +189,8 @@ class FluxTrainer:
             reward_function=self._reward_function,
         )
 
-        # Initialize coordinator (sync wrapper for async init)
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        loop.run_until_complete(self._coordinator.initialize())
+        # Initialize coordinator with notebook-friendly event loop handling
+        self._run_async(self._coordinator.initialize())
 
         # Add step callbacks to coordinator
         for callback in self._step_callbacks:
@@ -219,6 +216,7 @@ class FluxTrainer:
         """Shutdown all components.
 
         Should be called after training is complete.
+        Handles notebook environments gracefully.
         """
         if not self._initialized:
             return
@@ -226,13 +224,7 @@ class FluxTrainer:
         logger.info("Tearing down FluxTrainer...")
 
         if self._coordinator is not None:
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-
-            loop.run_until_complete(self._coordinator.shutdown())
+            self._run_async(self._coordinator.shutdown())
             self._coordinator = None
 
         if self._logger is not None:
@@ -241,6 +233,47 @@ class FluxTrainer:
 
         self._initialized = False
         logger.info("FluxTrainer teardown complete")
+
+    def _run_async(self, coro) -> Any:
+        """Run async coroutine with notebook-friendly event loop handling.
+
+        Detects if running in a notebook (Jupyter) or async environment
+        and uses the appropriate pattern to run the coroutine.
+
+        Args:
+            coro: Coroutine to run.
+
+        Returns:
+            Result of the coroutine.
+        """
+        try:
+            # Check if there's a running event loop (notebook/async context)
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None and loop.is_running():
+            # Running in notebook or async context
+            # Try nest_asyncio if available
+            try:
+                import nest_asyncio
+                nest_asyncio.apply()
+                return loop.run_until_complete(coro)
+            except ImportError:
+                # Fall back to thread pool executor
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, coro)
+                    return future.result()
+        else:
+            # No running loop - create one
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            return loop.run_until_complete(coro)
 
     def fit(
         self,
@@ -511,7 +544,7 @@ class FluxTrainer:
             metrics["throughput"] = step_result.training_result.throughput
 
         if step_result.staleness_metrics:
-            metrics["staleness"] = step_result.staleness_metrics.staleness
+            metrics["staleness"] = step_result.staleness_metrics.combined_staleness
             metrics["kl_divergence"] = step_result.staleness_metrics.kl_divergence
 
         if step_result.async_decision:

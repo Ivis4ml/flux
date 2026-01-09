@@ -213,6 +213,36 @@ class TrajectoryBatch:
             return 0
         return max(t.total_length for t in self.trajectories)
 
+    @property
+    def tokens(self) -> list[list[int]]:
+        """Token IDs for each trajectory."""
+        return [t.tokens for t in self.trajectories]
+
+    @property
+    def rewards(self) -> list[float]:
+        """Scalar rewards for each trajectory."""
+        return [t.reward for t in self.trajectories]
+
+    @property
+    def token_rewards(self) -> list[list[float]]:
+        """Per-token rewards for each trajectory."""
+        return [t.token_rewards for t in self.trajectories]
+
+    @property
+    def loss_mask(self) -> list[list[int]]:
+        """Loss mask for each trajectory."""
+        return [t.loss_mask for t in self.trajectories]
+
+    @property
+    def behavior_log_probs(self) -> list[list[float]]:
+        """Behavior policy log probs for each trajectory."""
+        return [t.behavior_log_probs for t in self.trajectories]
+
+    @property
+    def num_tokens(self) -> int:
+        """Total tokens across all trajectories."""
+        return sum(t.total_length for t in self.trajectories)
+
     def to_tensors(
         self,
         device: str | torch.device = "cpu",
@@ -246,8 +276,22 @@ class TrajectoryBatch:
             input_ids[i, :seq_len] = torch.tensor(traj.tokens)
             attention_mask[i, :seq_len] = 1
 
-            if traj.loss_mask:
-                loss_mask[i, :len(traj.loss_mask)] = torch.tensor(traj.loss_mask, dtype=torch.float)
+            loss_mask_list = traj.loss_mask
+            if not loss_mask_list and seq_len > 0:
+                prompt_len = max(0, min(traj.prompt_length, seq_len))
+                response_len = max(0, min(traj.response_length, seq_len - prompt_len))
+                if response_len > 0:
+                    loss_mask_list = [0] * prompt_len + [1] * response_len
+                    if len(loss_mask_list) < seq_len:
+                        loss_mask_list.extend([1] * (seq_len - len(loss_mask_list)))
+                else:
+                    loss_mask_list = [1] * seq_len
+
+            if loss_mask_list:
+                loss_mask[i, :len(loss_mask_list)] = torch.tensor(
+                    loss_mask_list,
+                    dtype=torch.float,
+                )
 
             if traj.log_probs:
                 log_probs[i, :len(traj.log_probs)] = torch.tensor(traj.log_probs)
@@ -268,16 +312,26 @@ class TrajectoryBatch:
             versions[i] = traj.version.version_id
 
         # Move to device
+        self._input_ids = input_ids.to(device)
+        self._attention_mask = attention_mask.to(device)
+        self._loss_mask = loss_mask.to(device)
+        self._log_probs = log_probs.to(device)
+        self._behavior_log_probs = behavior_log_probs.to(device)
+        self._rewards = rewards.to(device)
+        self._advantages = advantages.to(device)
+        self._returns = returns.to(device)
+        self._versions = versions.to(device)
+
         return {
-            "input_ids": input_ids.to(device),
-            "attention_mask": attention_mask.to(device),
-            "loss_mask": loss_mask.to(device),
-            "log_probs": log_probs.to(device),
-            "behavior_log_probs": behavior_log_probs.to(device),
-            "rewards": rewards.to(device),
-            "advantages": advantages.to(device),
-            "returns": returns.to(device),
-            "versions": versions.to(device),
+            "input_ids": self._input_ids,
+            "attention_mask": self._attention_mask,
+            "loss_mask": self._loss_mask,
+            "log_probs": self._log_probs,
+            "behavior_log_probs": self._behavior_log_probs,
+            "rewards": self._rewards,
+            "advantages": self._advantages,
+            "returns": self._returns,
+            "versions": self._versions,
         }
 
     def compute_padding_ratio(self) -> float:

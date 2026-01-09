@@ -134,6 +134,12 @@ class TrainingState:
         self.epoch += 1
         self.step_in_epoch = 0
 
+    def update_from_batch(self, batch_metrics: BatchMetrics) -> None:
+        """Update counters from batch metrics."""
+        self.samples_seen += batch_metrics.batch_size
+        self.tokens_processed += batch_metrics.num_tokens
+        self.phase = self.get_phase()
+
 
 @dataclass
 class AsyncDecision:

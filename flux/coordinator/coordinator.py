@@ -2,17 +2,18 @@
 FluxCoordinator - Orchestrates the complete RLHF training loop.
 
 The coordinator manages the flow of data between:
-1. Rollout generation (SGLang)
+1. Rollout generation (SGLang via StreamingRolloutManager with APRIL)
 2. Reward computation
 3. Batch composition
 4. Training (Megatron)
-5. Weight synchronization
+5. Weight synchronization (via SGLangClient.update_weights)
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -20,7 +21,6 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from flux.controller.adaptive_async import AdaptiveAsyncScheduler
-from flux.controller.staleness import StalenessManager
 from flux.core.config import FluxConfig
 from flux.core.metrics import MetricsAggregator
 from flux.core.trajectory import Trajectory, TrajectoryBatch, TrajectoryBuffer
@@ -34,6 +34,7 @@ from flux.core.types import (
     TrainingState,
 )
 from flux.rewards.base import RewardFunction
+from flux.rollout.manager import StreamingRolloutManager
 from flux.rollout.sglang_client import SGLangClient
 from flux.sync.weight_sync import WeightSyncManager
 from flux.training.batch_composer import SmartBatchComposer
@@ -116,6 +117,7 @@ class FluxCoordinator:
         self._engine = training_engine
         self._sglang = sglang_client
         self._reward_fn = reward_function
+        self._rollout_manager: StreamingRolloutManager | None = None
 
         # State management
         self._state = CoordinatorState()
@@ -132,11 +134,13 @@ class FluxCoordinator:
         )
 
         # Adaptive async control
-        self._staleness_manager = StalenessManager(config=config.adaptive_async)
+        version_provider = lambda: self._state.version.version_id
         self._async_scheduler = AdaptiveAsyncScheduler(
             config=config.adaptive_async,
             batch_size=config.batch_size,
+            version_provider=version_provider,
         )
+        self._staleness_manager = self._async_scheduler.staleness_manager
 
         # Weight sync
         self._weight_sync = WeightSyncManager()
@@ -149,6 +153,9 @@ class FluxCoordinator:
 
         # Initialization flag
         self._initialized = False
+
+        # Flag for using real rollouts vs stub (for testing)
+        self._use_real_rollouts = config.rollout.use_real_rollouts if hasattr(config.rollout, 'use_real_rollouts') else True
 
     @property
     def state(self) -> CoordinatorState:
@@ -209,11 +216,21 @@ class FluxCoordinator:
             except Exception as e:
                 logger.warning(f"Failed to connect to SGLang: {e}")
 
+        # Initialize StreamingRolloutManager with APRIL strategy
+        version_provider = lambda: self._state.version
+        self._rollout_manager = StreamingRolloutManager(
+            client=self._sglang,
+            config=self.config.rollout,
+            trajectory_buffer=self._buffer,
+            version_provider=version_provider,
+        )
+        logger.info("StreamingRolloutManager initialized with APRIL strategy")
+
         # Initialize reward function if not provided
         if self._reward_fn is None:
             self._reward_fn = self._create_default_reward_function()
 
-        # Initialize weight sync
+        # Initialize weight sync with SGLang servers
         sglang_urls = self._sglang._server_urls if hasattr(self._sglang, '_server_urls') else []
         for url in sglang_urls:
             self._weight_sync.add_server(url)
@@ -331,7 +348,7 @@ class FluxCoordinator:
         self._buffer.add_batch(trajectories)
 
         # 4. Get adaptive async decision
-        staleness_metrics = self._staleness_manager.compute_staleness(trajectories)
+        staleness_metrics = self._compute_staleness_metrics(trajectories)
         async_decision = self._async_scheduler.step(staleness_metrics=staleness_metrics)
 
         # 5. Compose batch
@@ -396,7 +413,7 @@ class FluxCoordinator:
         self._buffer.add_batch(trajectories)
 
         # 4. Get adaptive async decision
-        staleness_metrics = self._staleness_manager.compute_staleness(trajectories)
+        staleness_metrics = self._compute_staleness_metrics(trajectories)
         async_decision = self._async_scheduler.step(staleness_metrics=staleness_metrics)
 
         # 5. Compose batch
@@ -465,28 +482,61 @@ class FluxCoordinator:
     def _generate_rollouts_sync(self, prompts: list[str]) -> list[Trajectory]:
         """Generate rollouts synchronously.
 
+        Uses asyncio.run or event loop to call async rollout generation.
+        Falls back to stub if real rollouts not available.
+
         Args:
             prompts: Prompts to generate responses for.
 
         Returns:
             List of generated trajectories.
         """
-        trajectories = []
+        if not self._use_real_rollouts or self._rollout_manager is None:
+            return self._generate_rollouts_stub(prompts)
 
+        # Run async generation in sync context
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None:
+            # Already in async context - use nest_asyncio pattern or schedule
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    asyncio.run,
+                    self._generate_rollouts_async(prompts)
+                )
+                return future.result()
+        else:
+            # No running loop - create one
+            return asyncio.run(self._generate_rollouts_async(prompts))
+
+    def _generate_rollouts_stub(self, prompts: list[str]) -> list[Trajectory]:
+        """Generate stub trajectories for testing.
+
+        Args:
+            prompts: Prompts to generate responses for.
+
+        Returns:
+            List of stub trajectories.
+        """
+        trajectories = []
         for i, prompt in enumerate(prompts):
-            # Create a simple trajectory (actual generation would use SGLang)
             traj = Trajectory(
                 id=f"traj-{self._state.step}-{i}",
                 prompt=prompt,
-                response="",  # Would be filled by SGLang
+                response="",
                 version=self._state.version,
             )
             trajectories.append(traj)
-
         return trajectories
 
     async def _generate_rollouts_async(self, prompts: list[str]) -> list[Trajectory]:
-        """Generate rollouts asynchronously using SGLang.
+        """Generate rollouts asynchronously using StreamingRolloutManager.
+
+        Uses APRIL strategy: oversample, abort long-tail, partial reuse.
 
         Args:
             prompts: Prompts to generate responses for.
@@ -494,39 +544,33 @@ class FluxCoordinator:
         Returns:
             List of generated trajectories.
         """
+        if not self._use_real_rollouts or self._rollout_manager is None:
+            return self._generate_rollouts_stub(prompts)
+
         if self._sglang is None or not self._sglang.is_connected:
-            return self._generate_rollouts_sync(prompts)
+            logger.warning("SGLang not connected, using stub rollouts")
+            return self._generate_rollouts_stub(prompts)
 
-        trajectories = []
-
-        # Generate in parallel
-        tasks = []
-        for prompt in prompts:
-            tasks.append(self._sglang.generate(
-                prompt=prompt,
-                max_tokens=self.config.rollout.max_tokens,
-                temperature=self.config.rollout.temperature,
-            ))
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for i, (prompt, result) in enumerate(zip(prompts, results)):
-            if isinstance(result, Exception):
-                logger.warning(f"Generation failed for prompt {i}: {result}")
-                continue
-
-            traj = Trajectory(
-                id=f"traj-{self._state.step}-{i}",
-                prompt=prompt,
-                response=result.response if hasattr(result, 'response') else "",
-                tokens=result.tokens if hasattr(result, 'tokens') else [],
-                log_probs=result.log_probs if hasattr(result, 'log_probs') else [],
-                behavior_log_probs=result.log_probs if hasattr(result, 'log_probs') else [],
-                version=self._state.version,
+        try:
+            # Use StreamingRolloutManager with APRIL strategy
+            batch = await self._rollout_manager.generate_batch(
+                prompts=prompts,
+                target_count=self.config.batch_size,
+                timeout=self.config.rollout.batch_timeout,
             )
-            trajectories.append(traj)
 
-        return trajectories
+            # Log rollout metrics
+            logger.debug(
+                f"Rollout batch: {batch.completed} completed, "
+                f"{batch.aborted} aborted, {batch.reused} reused, "
+                f"success_rate={batch.success_rate:.2%}"
+            )
+
+            return batch.trajectories
+
+        except Exception as e:
+            logger.error(f"Rollout generation failed: {e}")
+            return self._generate_rollouts_stub(prompts)
 
     def _compute_rewards(self, trajectories: list[Trajectory]) -> list[Trajectory]:
         """Compute rewards for trajectories.
@@ -552,6 +596,19 @@ class FluxCoordinator:
             self._state.rewards_sum += traj.reward
 
         return trajectories
+
+    def _compute_staleness_metrics(
+        self, trajectories: list[Trajectory]
+    ) -> StalenessMetrics:
+        """Compute staleness metrics from trajectory versions."""
+        if not trajectories:
+            return self._staleness_manager.compute_staleness(version_gap=0.0)
+
+        gaps = [
+            traj.get_version_gap(self._state.version) for traj in trajectories
+        ]
+        avg_gap = sum(gaps) / len(gaps) if gaps else 0.0
+        return self._staleness_manager.compute_staleness(version_gap=avg_gap)
 
     def _compose_batch(self) -> TrajectoryBatch | None:
         """Compose a batch from the buffer.
@@ -599,30 +656,65 @@ class FluxCoordinator:
             return None
 
     def _sync_weights(self) -> None:
-        """Synchronize weights to inference servers (sync version)."""
+        """Synchronize weights to inference servers (sync version).
+
+        Uses asyncio.run to call the async version.
+        """
         if self._engine is None:
             return
 
         try:
-            state_dict = self._engine.get_state_dict()
-            self._weight_sync.mark_updated()
-            # Actual sync would happen here
-            logger.debug(f"Weights synced at version {self._state.version.version_id}")
-        except Exception as e:
-            logger.warning(f"Weight sync failed: {e}")
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None:
+            # Already in async context - use thread pool
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    asyncio.run,
+                    self._sync_weights_async()
+                )
+                future.result()
+        else:
+            asyncio.run(self._sync_weights_async())
 
     async def _sync_weights_async(self) -> None:
-        """Synchronize weights to inference servers (async version)."""
+        """Synchronize weights to inference servers via SGLangClient.update_weights.
+
+        Pushes model weights to all connected SGLang servers.
+        """
         if self._engine is None:
             return
 
+        if self._sglang is None:
+            logger.warning("SGLang client not available for weight sync")
+            return
+
         try:
+            # Get state dict from training engine
             state_dict = self._engine.get_state_dict()
-            self._weight_sync.mark_updated()
-            # Actual async sync would happen here
-            logger.debug(f"Weights synced at version {self._state.version.version_id}")
+            version = self._state.version.version_id
+
+            # Push weights to SGLang server(s)
+            if hasattr(self._sglang, 'update_weights'):
+                success = await self._sglang.update_weights(
+                    weights=state_dict,
+                    version=version,
+                )
+                if success:
+                    self._weight_sync.mark_updated()
+                    logger.info(f"Weights synced to SGLang at version {version}")
+                else:
+                    logger.warning(f"Weight sync to SGLang returned False at version {version}")
+            else:
+                # Fallback for testing without full SGLang
+                self._weight_sync.mark_updated()
+                logger.debug(f"Weight sync marked (SGLang update_weights not available) at version {version}")
+
         except Exception as e:
-            logger.warning(f"Weight sync failed: {e}")
+            logger.error(f"Weight sync failed: {e}")
 
     def _create_default_reward_function(self) -> RewardFunction:
         """Create default reward function based on config.

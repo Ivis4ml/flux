@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable, Iterator
 
 import torch
@@ -178,6 +179,41 @@ class MegatronEngine(TrainingEngine):
         self._is_initialized = True
         logger.info("Megatron engine initialized")
 
+    def _resolve_algorithm_names(
+        self, algo_config: AlgorithmConfig
+    ) -> tuple[str, str]:
+        """Resolve advantage estimator and policy loss names."""
+        algo_name = algo_config.name
+        if isinstance(algo_name, Enum):
+            algo_name = algo_name.value
+        else:
+            algo_name = str(algo_name)
+
+        adv_name = algo_config.adv_estimator
+        loss_name = algo_config.policy_loss
+
+        mapping = {
+            "ppo": ("gae", "ppo"),
+            "grpo": ("grpo", "grpo"),
+            "reinforce": ("reinforce", "reinforce"),
+            "dpo": ("dpo", "dpo"),
+            "dapo": ("dapo", "dapo"),
+            "gspo": ("gspo", "gspo"),
+            "rloo": ("rloo", "rloo"),
+        }
+
+        if adv_name is None or loss_name is None:
+            mapped = mapping.get(algo_name, (algo_name, algo_name))
+            if adv_name is None:
+                adv_name = mapped[0]
+            if loss_name is None:
+                loss_name = mapped[1]
+
+        if algo_name == "ppo" and algo_config.kl_coef > 0:
+            loss_name = "ppo_kl"
+
+        return adv_name, loss_name
+
     def load_model(self, model_path: str) -> None:
         """Load model from path.
 
@@ -250,15 +286,44 @@ class MegatronEngine(TrainingEngine):
         # Get algorithm functions
         from flux.training.algorithms import get_policy_loss_fn, get_adv_estimator_fn
 
-        adv_fn = get_adv_estimator_fn(algo_config.name)
-        loss_fn = get_policy_loss_fn(algo_config.name)
+        adv_name, loss_name = self._resolve_algorithm_names(algo_config)
+        adv_fn = get_adv_estimator_fn(adv_name)
+        loss_fn = get_policy_loss_fn(loss_name)
+
+        # Prepare tensors
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        tensors = batch.to_tensors(device=device, pad_token_id=0)
+        input_ids = tensors.get("input_ids")
+        loss_mask = tensors.get("loss_mask")
+        behavior_log_probs = tensors.get("behavior_log_probs")
+        rewards = tensors.get("rewards")
+
+        if input_ids is None or loss_mask is None or behavior_log_probs is None or rewards is None:
+            raise RuntimeError("Batch tensors missing required fields")
+
+        # Build token-level rewards
+        token_rewards = None
+        if any(traj.token_rewards for traj in batch.trajectories):
+            token_rewards = torch.zeros_like(loss_mask)
+            for i, traj in enumerate(batch.trajectories):
+                if not traj.token_rewards:
+                    continue
+                length = min(len(traj.token_rewards), token_rewards.shape[1])
+                token_rewards[i, :length] = torch.tensor(
+                    traj.token_rewards[:length],
+                    device=device,
+                    dtype=token_rewards.dtype,
+                )
+        token_level_rewards = (
+            token_rewards if token_rewards is not None else rewards.unsqueeze(-1) * loss_mask
+        )
 
         # Compute advantages
         advantages, returns = adv_fn(
-            rewards=batch.rewards,
-            mask=batch.loss_mask,
+            token_level_rewards=token_level_rewards,
+            response_mask=loss_mask,
             gamma=algo_config.gamma,
-            gae_lambda=algo_config.gae_lambda,
+            lam=algo_config.gae_lambda,
         )
 
         # Normalize advantages if configured
@@ -273,18 +338,8 @@ class MegatronEngine(TrainingEngine):
         # This is a stub showing the structure
 
         try:
-            if hasattr(batch, 'tokens') and batch.tokens is not None:
-                tokens = batch.tokens
-                if isinstance(tokens, list):
-                    # Pad and convert to tensor
-                    max_len = max(len(t) for t in tokens)
-                    padded = torch.zeros(len(tokens), max_len, dtype=torch.long)
-                    for i, t in enumerate(tokens):
-                        padded[i, :len(t)] = torch.tensor(t)
-                    tokens = padded
-
-                if torch.cuda.is_available():
-                    tokens = tokens.cuda()
+            if input_ids.numel() > 0:
+                tokens = input_ids
 
                 outputs = self._model(tokens)
                 logits = outputs.logits if hasattr(outputs, 'logits') else outputs
@@ -293,29 +348,25 @@ class MegatronEngine(TrainingEngine):
                 log_probs = torch.log_softmax(logits, dim=-1)
                 # Gather log probs for actual tokens
                 token_log_probs = log_probs[:, :-1].gather(
-                    -1, tokens[:, 1:].unsqueeze(-1)
+                    -1,
+                    tokens[:, 1:].unsqueeze(-1),
                 ).squeeze(-1)
 
-                # Get behavior log probs from batch
-                behavior_log_probs = batch.behavior_log_probs
-                if isinstance(behavior_log_probs, list):
-                    behavior_log_probs = torch.tensor(behavior_log_probs)
-                if torch.cuda.is_available():
-                    behavior_log_probs = behavior_log_probs.cuda()
-
-                # Compute loss
-                loss_mask = batch.loss_mask
-                if isinstance(loss_mask, list):
-                    loss_mask = torch.tensor(loss_mask)
-                if torch.cuda.is_available():
-                    loss_mask = loss_mask.cuda()
+                # Align masks and behavior log probs with token_log_probs
+                target_len = token_log_probs.shape[1]
+                behavior_log_probs = behavior_log_probs[:, :target_len]
+                loss_mask = loss_mask[:, :target_len]
+                token_level_rewards = token_level_rewards[:, :target_len]
 
                 loss, loss_metrics = loss_fn(
-                    old_logp=behavior_log_probs,
-                    logp=token_log_probs,
-                    adv=advantages,
-                    mask=loss_mask,
-                    clip_range=algo_config.clip_range,
+                    old_log_prob=behavior_log_probs,
+                    log_prob=token_log_probs,
+                    advantages=advantages[:, :target_len],
+                    response_mask=loss_mask,
+                    clip_ratio=algo_config.clip_range,
+                    entropy_coef=algo_config.entropy_coef,
+                    kl_coef=algo_config.kl_coef,
+                    target_kl=algo_config.kl_target,
                 )
             else:
                 # Dummy loss for testing

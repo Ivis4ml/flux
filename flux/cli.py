@@ -198,7 +198,7 @@ def cmd_generate(args: argparse.Namespace) -> int:
                 print(f"Tokens: {result.completion_tokens}")
                 print(f"Time: {result.elapsed_ms:.0f}ms")
 
-            await client.disconnect()
+            await client.close()
 
         asyncio.run(run_generation())
         return 0

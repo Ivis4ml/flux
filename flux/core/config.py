@@ -21,6 +21,9 @@ class AlgorithmType(str, Enum):
     PPO = "ppo"
     GRPO = "grpo"
     DPO = "dpo"
+    DAPO = "dapo"
+    GSPO = "gspo"
+    RLOO = "rloo"
     REINFORCE = "reinforce"
     CUSTOM = "custom"
 
@@ -204,6 +207,8 @@ class AlgorithmConfig(BaseConfig):
         normalize_advantages: Whether to normalize advantages.
         kl_coef: KL divergence coefficient.
         kl_target: Target KL divergence for adaptive KL.
+        adv_estimator: Override for advantage estimator registry key.
+        policy_loss: Override for policy loss registry key.
     """
 
     name: AlgorithmType = Field(default=AlgorithmType.GRPO)
@@ -217,6 +222,8 @@ class AlgorithmConfig(BaseConfig):
     normalize_advantages: bool = Field(default=True)
     kl_coef: float = Field(default=0.0, ge=0.0)
     kl_target: float | None = Field(default=None, ge=0.0)
+    adv_estimator: str | None = Field(default=None)
+    policy_loss: str | None = Field(default=None)
 
 
 class RewardConfig(BaseConfig):
