@@ -414,14 +414,11 @@ class SGLangClient:
 
         # Determine status from finish reason
         finish_type = finish_reason.get("type", "stop") if isinstance(finish_reason, dict) else str(finish_reason)
-        if finish_type == "length":
-            status = GenerationStatus.TRUNCATED
-        elif finish_type == "abort":
-            status = GenerationStatus.ABORTED
-        elif finish_type in ("stop", "eos_token"):
-            status = GenerationStatus.COMPLETED
-        else:
-            status = GenerationStatus.COMPLETED
+        status_map = {
+            "length": GenerationStatus.TRUNCATED,
+            "abort": GenerationStatus.ABORTED,
+        }
+        status = status_map.get(finish_type, GenerationStatus.COMPLETED)
 
         return GenerationResult(
             request_id=request.request_id,

@@ -331,16 +331,11 @@ class StalenessManager:
             Whether to trigger sync.
         """
         with self._lock:
-            # Check staleness threshold
             threshold = self.config.target_staleness + self.config.tolerance
-            if self._ema_staleness > threshold:
-                return True
-
-            # Check max steps without sync
-            if self._steps_since_sync >= self.config.max_steps_without_sync:
-                return True
-
-            return False
+            return (
+                self._ema_staleness > threshold
+                or self._steps_since_sync >= self.config.max_steps_without_sync
+            )
 
     def record_sync(self) -> None:
         """Record that a sync barrier was triggered."""
@@ -414,13 +409,9 @@ class StalenessManager:
             Average combined staleness.
         """
         with self._lock:
-            if not self._history:
-                return 0.0
-
             recent = list(self._history)[-last_n:]
             if not recent:
                 return 0.0
-
             return sum(r.staleness.combined_staleness for r in recent) / len(recent)
 
     def get_version_gap_stats(self) -> dict[str, float]:

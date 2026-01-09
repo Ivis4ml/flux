@@ -480,13 +480,7 @@ class CircuitBreaker:
 
     def allow_request(self) -> bool:
         """Check if request should be allowed."""
-        state = self.state
-        if state == self.State.CLOSED:
-            return True
-        elif state == self.State.HALF_OPEN:
-            return True
-        else:
-            return False
+        return self.state != self.State.OPEN
 
     def __call__(self, func: F) -> F:
         """Decorator to wrap function with circuit breaker."""

@@ -10,21 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import time
-from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import (
     Any,
     AsyncIterator,
     Callable,
     Dict,
-    Generic,
     List,
     Optional,
     Tuple,
-    TypeVar,
-    Union,
 )
 
 import numpy as np
@@ -116,24 +111,17 @@ class Trajectory:
     
     # Version boundaries (for trajectories spanning policy updates)
     version_segments: List[Tuple[int, int, int]] = field(default_factory=list)
-    
+
+    # Staleness is derived from policy_version vs current version (see get_version_gap in trajectory.py)
+
     @property
     def length(self) -> int:
         return len(self.tokens)
-    
+
     @property
     def total_length(self) -> int:
         return len(self.prompt) + len(self.response)
-    
-    @property
-    def staleness(self) -> int:
-        # Will be set by the system
-        return getattr(self, '_staleness', 0)
-    
-    @staleness.setter
-    def staleness(self, value: int):
-        self._staleness = value
-    
+
     @property
     def has_version_boundaries(self) -> bool:
         return len(self.version_segments) > 1
@@ -613,21 +601,22 @@ class SmartBatchComposer:
     ) -> Dict[str, List[Trajectory]]:
         """Group by length ranges."""
         buckets = defaultdict(list)
-        
+
         for traj in trajectories:
-            length = traj.total_length
-            if length <= 512:
-                bucket_id = "short"
-            elif length <= 1024:
-                bucket_id = "medium"
-            elif length <= 2048:
-                bucket_id = "long"
-            else:
-                bucket_id = "very_long"
-            
+            bucket_id = self._get_length_bucket(traj.total_length)
             buckets[bucket_id].append(traj)
-        
+
         return buckets
+
+    def _get_length_bucket(self, length: int) -> str:
+        """Determine bucket ID for a given length."""
+        if length <= 512:
+            return "short"
+        if length <= 1024:
+            return "medium"
+        if length <= 2048:
+            return "long"
+        return "very_long"
     
     def _stratified_sample(
         self,
@@ -635,35 +624,32 @@ class SmartBatchComposer:
         n: int
     ) -> List[Trajectory]:
         """Sample with staleness balancing."""
-        # Flatten all candidates
-        all_trajs = []
-        for bucket in buckets.values():
-            all_trajs.extend(bucket)
-        
+        all_trajs = [traj for bucket in buckets.values() for traj in bucket]
+
         if len(all_trajs) <= n:
             return all_trajs
-        
+
         # Group by staleness
         staleness_groups = defaultdict(list)
         for traj in all_trajs:
-            staleness_bucket = int(traj.staleness)
-            staleness_groups[staleness_bucket].append(traj)
-        
-        # Sample proportionally
+            staleness_groups[int(traj.staleness)].append(traj)
+
+        # Sample proportionally from each staleness group
         selected = []
         samples_per_group = n // max(len(staleness_groups), 1)
-        
+
         for group_id in sorted(staleness_groups.keys()):
             group = staleness_groups[group_id]
             to_take = min(samples_per_group, len(group))
             selected.extend(np.random.choice(group, to_take, replace=False).tolist())
-        
-        # Fill remaining
-        remaining = [t for t in all_trajs if t not in selected]
+
+        # Fill remaining slots from unused trajectories
+        selected_ids = {id(traj) for traj in selected}
+        remaining = [t for t in all_trajs if id(t) not in selected_ids]
         if len(selected) < n and remaining:
             additional = min(n - len(selected), len(remaining))
             selected.extend(np.random.choice(remaining, additional, replace=False).tolist())
-        
+
         return selected[:n]
     
     def _curriculum_order(
@@ -672,32 +658,24 @@ class SmartBatchComposer:
         progress: float
     ) -> List[Trajectory]:
         """Order by difficulty for curriculum learning."""
-        # Estimate difficulty if not set
+        # Estimate difficulty for trajectories that don't have it set
         for traj in trajectories:
             if traj.difficulty is None:
-                traj.difficulty = self._estimate_difficulty(traj)
-        
+                traj.difficulty = traj.length / 2048
+
         # Sort by difficulty
         sorted_trajs = sorted(trajectories, key=lambda t: t.difficulty)
-        
-        # Add some randomness (less as training progresses)
+
+        # Add randomness that decreases as training progresses
         randomness = 1.0 - progress
         if randomness > 0.1:
             window_size = max(1, int(len(sorted_trajs) * randomness))
             for i in range(0, len(sorted_trajs), window_size):
-                window = sorted_trajs[i:i+window_size]
+                window = sorted_trajs[i:i + window_size]
                 np.random.shuffle(window)
-                sorted_trajs[i:i+window_size] = window
-        
+                sorted_trajs[i:i + window_size] = window
+
         return sorted_trajs
-    
-    def _estimate_difficulty(self, trajectory: Trajectory) -> float:
-        """Estimate trajectory difficulty."""
-        # Simple heuristics
-        length_score = trajectory.length / 2048
-        
-        # Could add: reward variance, historical success rate, etc.
-        return length_score
 
 
 # =============================================================================
@@ -759,11 +737,12 @@ class WeightSyncManager:
         """Take a weight snapshot for delta compression."""
         # In real implementation, would clone current weights
         self.weight_snapshots[self.current_version] = {}
-        
-        # Keep only recent snapshots
-        old_versions = [v for v in self.weight_snapshots if v < self.current_version - 50]
-        for v in old_versions:
-            del self.weight_snapshots[v]
+
+        # Remove snapshots older than 50 versions
+        min_version = self.current_version - 50
+        self.weight_snapshots = {
+            v: s for v, s in self.weight_snapshots.items() if v >= min_version
+        }
     
     def _can_delta_sync(self, from_version: int) -> bool:
         """Check if delta sync is possible from given version."""
@@ -911,11 +890,19 @@ class FluxCoordinator:
         """Get placeholder metrics for controller."""
         if self.metrics_history:
             return self.metrics_history[-1]
+        return self._create_empty_metrics()
+
+    def _create_empty_metrics(self) -> BatchMetrics:
+        """Create empty metrics with all values set to zero."""
         return BatchMetrics(
-            loss=0.0, reward_mean=0.0, reward_std=0.0,
-            kl_divergence=0.0, importance_weight_variance=0.0,
-            mean_version_gap=0.0, samples_per_second=0.0,
-            tokens_per_second=0.0
+            loss=0.0,
+            reward_mean=0.0,
+            reward_std=0.0,
+            kl_divergence=0.0,
+            importance_weight_variance=0.0,
+            mean_version_gap=0.0,
+            samples_per_second=0.0,
+            tokens_per_second=0.0,
         )
 
 
@@ -942,33 +929,20 @@ class FluxTrainer:
         num_steps: Optional[int] = None,
         callbacks: Optional[List[Callable]] = None
     ):
-        """
-        Run training loop.
-        
-        Args:
-            prompts: Training prompts
-            num_steps: Number of training steps
-            callbacks: Optional callbacks
-        """
+        """Run training loop."""
         num_steps = num_steps or self.config.num_steps
         callbacks = callbacks or []
-        
+
         for step in range(num_steps):
-            # Sample prompts for this step
             batch_prompts = self._sample_prompts(prompts, self.config.batch_size)
-            
-            # Train step
             metrics = await self.coordinator.train_step(batch_prompts)
-            
-            # Logging
+
             if step % self.config.log_interval == 0:
                 self._log_metrics(step, metrics)
-            
-            # Callbacks
+
             for callback in callbacks:
                 callback(step, metrics)
-            
-            # Checkpointing
+
             if step % self.config.checkpoint_interval == 0:
                 self.save_checkpoint(f"checkpoint_{step}")
     
@@ -983,13 +957,14 @@ class FluxTrainer:
     
     def _log_metrics(self, step: int, metrics: BatchMetrics):
         """Log training metrics."""
-        controller_stats = self.coordinator.async_controller.get_stats()
-        
-        print(f"Step {step}: "
-              f"loss={metrics.loss:.4f}, "
-              f"reward={metrics.reward_mean:.4f}, "
-              f"async_ratio={controller_stats['async_ratio']:.2f}, "
-              f"staleness={controller_stats['staleness_ema']:.3f}")
+        stats = self.coordinator.async_controller.get_stats()
+        print(
+            f"Step {step}: "
+            f"loss={metrics.loss:.4f}, "
+            f"reward={metrics.reward_mean:.4f}, "
+            f"async_ratio={stats['async_ratio']:.2f}, "
+            f"staleness={stats['staleness_ema']:.3f}"
+        )
     
     def save_checkpoint(self, path: str):
         """Save checkpoint."""

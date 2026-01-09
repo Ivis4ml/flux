@@ -356,28 +356,36 @@ class LengthPredictor:
             Dict mapping bucket name to list of (prompt, prediction) tuples.
         """
         predictions = self.predict_batch(prompts)
+
+        # Build bucket names list: [<first, first-second, ..., >last]
+        bucket_names = [f"<{bucket_boundaries[0]}"]
+        bucket_names.extend(
+            f"{bucket_boundaries[i]}-{bucket_boundaries[i+1]}"
+            for i in range(len(bucket_boundaries) - 1)
+        )
+        bucket_names.append(f">{bucket_boundaries[-1]}")
+
         buckets: dict[str, list[tuple[str, LengthPrediction]]] = {
-            f"<{bucket_boundaries[0]}": []
+            name: [] for name in bucket_names
         }
-        for i in range(len(bucket_boundaries) - 1):
-            buckets[f"{bucket_boundaries[i]}-{bucket_boundaries[i+1]}"] = []
-        buckets[f">{bucket_boundaries[-1]}"] = []
 
         for prompt, pred in zip(prompts, predictions):
             length = pred.predicted_length
-            if length < bucket_boundaries[0]:
-                bucket = f"<{bucket_boundaries[0]}"
-            elif length > bucket_boundaries[-1]:
-                bucket = f">{bucket_boundaries[-1]}"
-            else:
-                for i in range(len(bucket_boundaries) - 1):
-                    if bucket_boundaries[i] <= length < bucket_boundaries[i + 1]:
-                        bucket = f"{bucket_boundaries[i]}-{bucket_boundaries[i+1]}"
-                        break
-
-            buckets[bucket].append((prompt, pred))
+            bucket_name = self._get_bucket_name(length, bucket_boundaries)
+            buckets[bucket_name].append((prompt, pred))
 
         return buckets
+
+    def _get_bucket_name(self, length: int, boundaries: tuple[int, ...]) -> str:
+        """Get the bucket name for a given length."""
+        if length < boundaries[0]:
+            return f"<{boundaries[0]}"
+        if length >= boundaries[-1]:
+            return f">{boundaries[-1]}"
+        for i in range(len(boundaries) - 1):
+            if boundaries[i] <= length < boundaries[i + 1]:
+                return f"{boundaries[i]}-{boundaries[i+1]}"
+        return f">{boundaries[-1]}"
 
     def get_statistics(self) -> dict[str, float]:
         """Get predictor statistics.

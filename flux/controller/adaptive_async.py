@@ -257,29 +257,19 @@ class AdaptiveAsyncController:
         Returns:
             Whether to trigger sync.
         """
-        # Check staleness threshold
         threshold = self.config.target_staleness + self.config.tolerance
-        if current_staleness > threshold:
+        should_sync = (
+            current_staleness > threshold
+            or self._steps_since_sync >= self.config.max_steps_without_sync
+            or (self.staleness_manager is not None and self.staleness_manager.should_sync())
+        )
+
+        if should_sync:
             self._steps_since_sync = 0
             if self.staleness_manager is not None:
                 self.staleness_manager.record_sync()
-            return True
 
-        # Check max steps without sync
-        if self._steps_since_sync >= self.config.max_steps_without_sync:
-            self._steps_since_sync = 0
-            if self.staleness_manager is not None:
-                self.staleness_manager.record_sync()
-            return True
-
-        # Check from staleness manager if available
-        if self.staleness_manager is not None:
-            if self.staleness_manager.should_sync():
-                self._steps_since_sync = 0
-                self.staleness_manager.record_sync()
-                return True
-
-        return False
+        return should_sync
 
     def _adjust_for_phase(self, async_ratio: float) -> float:
         """Adjust async ratio based on training phase.
@@ -293,21 +283,18 @@ class AdaptiveAsyncController:
         Returns:
             Adjusted async ratio.
         """
-        if self._training_phase == TrainingPhase.WARMUP:
-            # Very conservative during warmup
-            return max(self.config.min_async_ratio, async_ratio * 0.5)
-        elif self._training_phase == TrainingPhase.EARLY:
-            # Slightly conservative
-            return max(self.config.min_async_ratio, async_ratio * 0.7)
-        elif self._training_phase == TrainingPhase.MID:
-            # Normal operation
-            return async_ratio
-        else:  # LATE
-            # Can be more aggressive
-            return min(
-                self.config.max_async_ratio,
-                async_ratio * 1.1,
-            )
+        # Phase multipliers: WARMUP=0.5 (conservative), EARLY=0.7, MID=1.0, LATE=1.1 (aggressive)
+        phase_multipliers = {
+            TrainingPhase.WARMUP: 0.5,
+            TrainingPhase.EARLY: 0.7,
+            TrainingPhase.MID: 1.0,
+            TrainingPhase.LATE: 1.1,
+        }
+        multiplier = phase_multipliers.get(self._training_phase, 1.0)
+        adjusted = async_ratio * multiplier
+
+        # Clamp to valid range
+        return max(self.config.min_async_ratio, min(self.config.max_async_ratio, adjusted))
 
     def set_training_phase(self, phase: TrainingPhase) -> None:
         """Update the training phase.

@@ -143,29 +143,16 @@ class SmartBatchComposer:
     def _create_length_buckets(self) -> list[LengthBucket]:
         """Create length buckets from configuration."""
         boundaries = list(self.config.length_bucket_boundaries)
-        buckets = []
 
-        # First bucket: 0 to first boundary
-        if boundaries:
-            buckets.append(LengthBucket(min_length=0, max_length=boundaries[0]))
+        if not boundaries:
+            return [LengthBucket(min_length=0, max_length=float("inf"))]
 
-            # Middle buckets
-            for i in range(len(boundaries) - 1):
-                buckets.append(LengthBucket(
-                    min_length=boundaries[i],
-                    max_length=boundaries[i + 1],
-                ))
-
-            # Last bucket: last boundary to infinity
-            buckets.append(LengthBucket(
-                min_length=boundaries[-1],
-                max_length=float("inf"),
-            ))
-        else:
-            # Single bucket if no boundaries
-            buckets.append(LengthBucket(min_length=0, max_length=float("inf")))
-
-        return buckets
+        # Build boundaries list: [0, b1, b2, ..., bn, inf]
+        all_bounds = [0] + boundaries + [float("inf")]
+        return [
+            LengthBucket(min_length=all_bounds[i], max_length=all_bounds[i + 1])
+            for i in range(len(all_bounds) - 1)
+        ]
 
     def _create_staleness_strata(self) -> list[StalenessStratum]:
         """Create staleness strata for stratified sampling."""
@@ -257,29 +244,34 @@ class SmartBatchComposer:
         n: int,
     ) -> list[Trajectory]:
         """Sample trajectories with balanced staleness distribution."""
-        result = []
         non_empty_strata = [s for s in self._strata if s.size > 0]
 
         if not non_empty_strata:
-            return result
+            return []
 
-        # Calculate per-stratum quota
+        # Calculate per-stratum quota and sample from each
         per_stratum = max(1, n // len(non_empty_strata))
+        result: list[Trajectory] = []
+        sampled_ids: set[int] = set()
 
         for stratum in non_empty_strata:
             sample_size = min(per_stratum, stratum.size)
             sampled = random.sample(stratum.trajectories, sample_size)
-            result.extend(sampled)
+            for traj in sampled:
+                traj_key = id(traj)
+                if traj_key not in sampled_ids:
+                    result.append(traj)
+                    sampled_ids.add(traj_key)
 
-        # Fill remaining quota
+        # Fill remaining quota from any stratum
         remaining = n - len(result)
         if remaining > 0:
-            all_remaining = []
-            for stratum in non_empty_strata:
-                for traj in stratum.trajectories:
-                    if traj not in result:
-                        all_remaining.append(traj)
-
+            all_remaining = [
+                traj
+                for stratum in non_empty_strata
+                for traj in stratum.trajectories
+                if id(traj) not in sampled_ids
+            ]
             if all_remaining:
                 extra = random.sample(all_remaining, min(remaining, len(all_remaining)))
                 result.extend(extra)
@@ -434,26 +426,18 @@ class SmartBatchComposer:
         Returns:
             Dictionary of composition statistics.
         """
-        bucket_stats = []
-        for bucket in self._buckets:
-            bucket_stats.append({
-                "range": f"{bucket.min_length}-{bucket.max_length}",
-                "size": bucket.size,
-            })
-
-        stratum_stats = []
-        for stratum in self._strata:
-            stratum_stats.append({
-                "range": f"{stratum.min_staleness}-{stratum.max_staleness}",
-                "size": stratum.size,
-            })
-
         return {
             "batch_size": self.batch_size,
             "current_version": self._current_version,
             "curriculum_step": self._curriculum_step,
-            "buckets": bucket_stats,
-            "strata": stratum_stats,
+            "buckets": [
+                {"range": f"{b.min_length}-{b.max_length}", "size": b.size}
+                for b in self._buckets
+            ],
+            "strata": [
+                {"range": f"{s.min_staleness}-{s.max_staleness}", "size": s.size}
+                for s in self._strata
+            ],
             "config": {
                 "use_length_bucketing": self.config.use_length_bucketing,
                 "use_staleness_balancing": self.config.use_staleness_balancing,

@@ -380,13 +380,12 @@ class StreamingRolloutManager:
         version: PolicyVersion,
     ) -> Trajectory:
         """Create a Trajectory from generation result."""
-        # Determine status
-        if result.status == GenerationStatus.TRUNCATED:
-            status = TrajectoryStatus.TRUNCATED
-        elif result.status == GenerationStatus.COMPLETED:
-            status = TrajectoryStatus.COMPLETED
-        else:
-            status = TrajectoryStatus.COMPLETED
+        status_map = {
+            GenerationStatus.TRUNCATED: TrajectoryStatus.TRUNCATED,
+            GenerationStatus.ABORTED: TrajectoryStatus.ABORTED,
+            GenerationStatus.FAILED: TrajectoryStatus.FAILED,
+        }
+        status = status_map.get(result.status, TrajectoryStatus.COMPLETED)
 
         return Trajectory(
             id=request.request_id,
