@@ -1,0 +1,94 @@
+# Flux Configuration for Qwen3-8B on 8 GPUs
+#
+# This configuration is optimized for:
+# - 8x NVIDIA H100 80GB GPUs
+# - Tensor Parallelism = 4, Data Parallelism = 2
+# - Balanced sync/async ratio for stability and throughput
+
+# Model Configuration
+model_path: "Qwen/Qwen3-8B"
+output_dir: "./outputs/qwen3-8b"
+
+# Training Hyperparameters
+num_steps: 10000
+batch_size: 32
+learning_rate: 1.0e-6
+weight_decay: 0.01
+warmup_steps: 100
+seed: 42
+
+# Adaptive Async Configuration
+# Target moderate staleness for balanced training
+adaptive_async:
+  target_staleness: 0.4        # 0=sync, 1=full async
+  min_async_ratio: 0.1         # Minimum async fraction
+  max_async_ratio: 0.7         # Maximum async fraction
+  kp: 0.1                      # Proportional gain
+  ki: 0.01                     # Integral gain
+  kd: 0.05                     # Derivative gain
+  update_frequency: 10         # Steps between ratio updates
+
+# Rollout Configuration
+rollout:
+  max_length: 2048
+  temperature: 0.8
+  top_p: 0.95
+  top_k: 50
+  num_return_sequences: 4      # Sequences per prompt for GRPO
+
+  # APRIL settings for efficient rollouts
+  april:
+    oversample_ratio: 1.5      # Generate 1.5x needed rollouts
+    batch_timeout: 30.0        # Timeout for batch completion
+    partial_reuse_threshold: 0.3  # Reuse partials above this ratio
+
+# Batch Composition
+batch_composer:
+  length_bucket_boundaries: [256, 512, 1024, 2048]
+  staleness_balance_weight: 0.3
+  curriculum_enabled: true
+  curriculum_decay: 0.995
+
+# Algorithm Configuration (GRPO)
+algorithm:
+  name: "grpo"
+  group_size: 4               # Match num_return_sequences
+  baseline: "mean"            # Group mean baseline
+  clip_ratio: 0.2
+  entropy_coef: 0.01
+  max_grad_norm: 1.0
+
+# Weight Synchronization
+weight_sync:
+  method: "delta"             # Delta sync for efficiency
+  interval: 2                 # Sync every 2 steps
+  compression: true           # Enable delta compression
+  snapshot_dir: "./snapshots"
+
+# Checkpointing
+checkpoint:
+  save_steps: 500
+  max_checkpoints: 5
+  keep_best: 3
+  save_optimizer: true
+
+# Logging
+logging:
+  log_level: "INFO"
+  log_steps: 10
+  wandb_project: "flux-qwen3-8b"
+  tensorboard_dir: "./logs/qwen3-8b"
+
+# Distributed Configuration
+# 8 GPUs: TP=4, DP=2 for optimal memory/compute balance
+distributed:
+  world_size: 8
+  tensor_parallel: 4
+  pipeline_parallel: 1
+  data_parallel: 2
+
+# Memory Optimization
+memory:
+  gradient_checkpointing: true
+  mixed_precision: "bf16"
+  max_memory_per_gpu: 70       # GB, leave headroom

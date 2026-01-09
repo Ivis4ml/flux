@@ -1,3 +1,54 @@
+Metadata-Version: 2.4
+Name: flux-rlhf
+Version: 0.1.0
+Summary: An Adaptive Post-Training Framework for Large Language Models
+Author-email: Flux Team <flux@example.com>
+License: Apache-2.0
+Project-URL: Homepage, https://github.com/flux-team/flux
+Project-URL: Documentation, https://flux-rlhf.readthedocs.io
+Project-URL: Repository, https://github.com/flux-team/flux
+Project-URL: Issues, https://github.com/flux-team/flux/issues
+Keywords: llm,rlhf,reinforcement-learning,post-training,machine-learning,deep-learning
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: torch>=2.0.0
+Requires-Dist: numpy>=1.24.0
+Requires-Dist: aiohttp>=3.8.0
+Requires-Dist: httpx>=0.24.0
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: PyYAML>=6.0
+Requires-Dist: rich>=13.0.0
+Requires-Dist: tqdm>=4.65.0
+Requires-Dist: tensorboard>=2.13.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.3.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.21.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.1.0; extra == "dev"
+Requires-Dist: pytest-mock>=3.11.0; extra == "dev"
+Requires-Dist: mypy>=1.4.0; extra == "dev"
+Requires-Dist: ruff>=0.0.280; extra == "dev"
+Requires-Dist: black>=23.7.0; extra == "dev"
+Requires-Dist: isort>=5.12.0; extra == "dev"
+Requires-Dist: pre-commit>=3.3.0; extra == "dev"
+Provides-Extra: sglang
+Requires-Dist: sglang>=0.1.0; extra == "sglang"
+Provides-Extra: megatron
+Requires-Dist: megatron-core>=0.4.0; extra == "megatron"
+Provides-Extra: all
+Requires-Dist: flux-rlhf[dev,megatron,sglang]; extra == "all"
+Dynamic: license-file
+
 # Flux
 
 ```

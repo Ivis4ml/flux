@@ -1,0 +1,113 @@
+# Flux Configuration for Qwen3-72B on 64 GPUs
+#
+# This configuration is optimized for:
+# - 8 nodes x 8 GPUs (64x NVIDIA H100 80GB)
+# - Tensor Parallelism = 8, Pipeline Parallelism = 2, Data Parallelism = 4
+# - Higher async ratio for maximum throughput at scale
+
+# Model Configuration
+model_path: "Qwen/Qwen3-72B"
+output_dir: "./outputs/qwen3-72b"
+
+# Training Hyperparameters
+num_steps: 50000
+batch_size: 128               # Large batch for stable gradients
+learning_rate: 5.0e-7         # Lower LR for large model
+weight_decay: 0.01
+warmup_steps: 500
+max_grad_norm: 1.0
+seed: 42
+
+# Adaptive Async Configuration
+# Higher async ratio for throughput at scale
+adaptive_async:
+  target_staleness: 0.5        # Moderate staleness target
+  min_async_ratio: 0.2         # Higher minimum async
+  max_async_ratio: 0.8         # Allow high async
+  kp: 0.08                     # Slightly lower gains for stability
+  ki: 0.008
+  kd: 0.04
+  update_frequency: 20         # Less frequent updates at scale
+
+# Rollout Configuration
+rollout:
+  max_length: 4096             # Longer context for 72B
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 40
+  num_return_sequences: 8      # More sequences for variance reduction
+
+  # APRIL settings - more aggressive for throughput
+  april:
+    oversample_ratio: 2.0      # Higher oversample at scale
+    batch_timeout: 60.0        # Longer timeout for large batches
+    partial_reuse_threshold: 0.25
+
+# Batch Composition
+batch_composer:
+  length_bucket_boundaries: [512, 1024, 2048, 4096]
+  staleness_balance_weight: 0.25
+  curriculum_enabled: true
+  curriculum_decay: 0.998      # Slower decay for longer training
+
+# Algorithm Configuration (GRPO with stability tweaks)
+algorithm:
+  name: "grpo"
+  group_size: 8
+  baseline: "leave_one_out"    # LOO baseline for large groups
+  clip_ratio: 0.15             # Tighter clip for stability
+  entropy_coef: 0.005          # Lower entropy bonus
+  max_grad_norm: 0.5           # Tighter gradient clipping
+
+# Weight Synchronization
+weight_sync:
+  method: "delta"
+  interval: 4                  # Less frequent sync at scale
+  compression: true
+  compression_threshold: 0.001 # Higher threshold for more compression
+  snapshot_dir: "./snapshots"
+
+# Checkpointing
+checkpoint:
+  save_steps: 1000
+  max_checkpoints: 10
+  keep_best: 5
+  save_optimizer: true
+  distributed_save: true       # Parallel checkpoint saving
+
+# Logging
+logging:
+  log_level: "INFO"
+  log_steps: 50
+  wandb_project: "flux-qwen3-72b"
+  tensorboard_dir: "./logs/qwen3-72b"
+
+# Distributed Configuration
+# 64 GPUs: TP=8, PP=2, DP=4
+distributed:
+  world_size: 64
+  tensor_parallel: 8           # Full TP within node
+  pipeline_parallel: 2         # 2-stage pipeline
+  data_parallel: 4             # 4-way data parallel
+
+  # Multi-node settings
+  master_addr: "node-0"
+  master_port: 29500
+  nccl_timeout: 1800           # 30 min timeout
+
+  # ZeRO optimization
+  zero_stage: 2                # ZeRO stage 2 for memory
+
+# Memory Optimization
+memory:
+  gradient_checkpointing: true
+  mixed_precision: "bf16"
+  max_memory_per_gpu: 75       # GB
+  cpu_offload: false           # Avoid CPU offload for speed
+
+# Fault Tolerance
+fault_tolerance:
+  checkpoint_on_signal: true
+  retry_on_failure: true
+  max_retries: 3
+  health_check_interval: 60    # seconds
