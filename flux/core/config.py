@@ -37,6 +37,14 @@ class RewardType(str, Enum):
     CUSTOM = "custom"
 
 
+class WeightSyncMethod(str, Enum):
+    """Weight synchronization methods."""
+
+    FULL = "full"  # Send complete state_dict
+    DELTA = "delta"  # Send only changed parameters
+    PER_TENSOR = "per_tensor"  # Stream individual tensors
+
+
 class BaseConfig(BaseModel):
     """Base configuration class with common settings."""
 
@@ -174,29 +182,36 @@ class WeightSyncConfig(BaseConfig):
     """Configuration for weight synchronization.
 
     Attributes:
+        method: Sync method - "full" (complete state_dict), "delta" (changed params only),
+                or "per_tensor" (stream individual tensors).
         sync_interval: Steps between weight syncs (0 = sync every step).
-        use_delta_compression: Whether to use delta compression for syncs.
         use_cuda_ipc: Whether to use CUDA IPC for same-node transfers.
-        sparsity_threshold: Threshold for sparse delta encoding.
+        sparsity_threshold: Threshold for sparse delta encoding (delta mode).
         sparsity_target: Target sparsity ratio for using sparse encoding.
         snapshot_interval: Steps between weight snapshots for delta computation.
         max_snapshots: Maximum number of snapshots to keep.
+        quantize: Whether to quantize weights before transfer (reduces bandwidth).
+        quantize_bits: Quantization bit width (8 or 16).
     """
 
+    method: WeightSyncMethod = Field(default=WeightSyncMethod.DELTA)
     sync_interval: int = Field(default=1, ge=0)
-    use_delta_compression: bool = Field(default=True)
     use_cuda_ipc: bool = Field(default=True)
     sparsity_threshold: float = Field(default=1e-6, ge=0.0)
     sparsity_target: float = Field(default=0.3, ge=0.0, le=1.0)
     snapshot_interval: int = Field(default=10, ge=1)
     max_snapshots: int = Field(default=5, ge=1)
+    quantize: bool = Field(default=False)
+    quantize_bits: Literal[8, 16] = Field(default=16)
 
 
 class AlgorithmConfig(BaseConfig):
     """Configuration for RL algorithm.
 
     Attributes:
-        name: Algorithm name (ppo, grpo, dpo, reinforce, custom).
+        name: Algorithm name - any string that maps to a registered algorithm.
+              Built-in: "ppo", "grpo", "dpo", "reinforce", "dapo", "gspo", "rloo".
+              Custom algorithms can be registered via @register_policy_loss decorator.
         clip_range: PPO clip range for policy ratio.
         clip_range_vf: PPO clip range for value function.
         entropy_coef: Entropy bonus coefficient.
@@ -211,7 +226,7 @@ class AlgorithmConfig(BaseConfig):
         policy_loss: Override for policy loss registry key.
     """
 
-    name: AlgorithmType = Field(default=AlgorithmType.GRPO)
+    name: str = Field(default="grpo")
     clip_range: float = Field(default=0.2, ge=0.0, le=1.0)
     clip_range_vf: float | None = Field(default=None, ge=0.0, le=1.0)
     entropy_coef: float = Field(default=0.01, ge=0.0)

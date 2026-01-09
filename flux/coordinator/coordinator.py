@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -157,6 +157,10 @@ class FluxCoordinator:
         # Flag for using real rollouts vs stub (for testing)
         self._use_real_rollouts = config.rollout.use_real_rollouts if hasattr(config.rollout, 'use_real_rollouts') else True
 
+        # Dedicated event loop for async operations (to avoid conflicts with notebooks)
+        self._async_loop: asyncio.AbstractEventLoop | None = None
+        self._async_thread: threading.Thread | None = None
+
     @property
     def state(self) -> CoordinatorState:
         """Current coordinator state."""
@@ -177,6 +181,76 @@ class FluxCoordinator:
         """Whether coordinator is initialized."""
         return self._initialized
 
+    def _ensure_async_loop(self) -> asyncio.AbstractEventLoop:
+        """Ensure a dedicated event loop is running for async operations.
+
+        This avoids conflicts with notebook event loops by running our
+        async operations on a separate thread with its own loop.
+
+        Returns:
+            The dedicated event loop.
+        """
+        if self._async_loop is not None and self._async_loop.is_running():
+            return self._async_loop
+
+        def _run_loop(loop: asyncio.AbstractEventLoop) -> None:
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+
+        self._async_loop = asyncio.new_event_loop()
+        self._async_thread = threading.Thread(
+            target=_run_loop,
+            args=(self._async_loop,),
+            daemon=True,
+            name="flux-async-loop",
+        )
+        self._async_thread.start()
+        return self._async_loop
+
+    def _run_async(self, coro) -> Any:
+        """Run a coroutine, handling both sync and async contexts.
+
+        Uses a dedicated event loop on a background thread to avoid
+        conflicts with notebook/REPL event loops.
+
+        Args:
+            coro: Coroutine to run.
+
+        Returns:
+            Result from the coroutine.
+        """
+        bg_loop = self._ensure_async_loop()
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+
+        if running is bg_loop:
+            raise RuntimeError("Cannot call _run_async from the coordinator async loop")
+
+        future = asyncio.run_coroutine_threadsafe(coro, bg_loop)
+        return future.result()
+
+    async def _await_async(self, coro) -> Any:
+        """Await a coroutine on the dedicated async loop when needed."""
+        bg_loop = self._ensure_async_loop()
+        running = asyncio.get_running_loop()
+
+        if running is bg_loop:
+            return await coro
+
+        future = asyncio.run_coroutine_threadsafe(coro, bg_loop)
+        return await asyncio.wrap_future(future)
+
+    def _stop_async_loop(self) -> None:
+        """Stop the dedicated async loop."""
+        if self._async_loop is not None and self._async_loop.is_running():
+            self._async_loop.call_soon_threadsafe(self._async_loop.stop)
+            if self._async_thread is not None and threading.current_thread() is not self._async_thread:
+                self._async_thread.join(timeout=5.0)
+        self._async_loop = None
+        self._async_thread = None
+
     def add_step_callback(self, callback: Callable[[StepResult], None]) -> None:
         """Add a callback to be called after each step.
 
@@ -190,6 +264,10 @@ class FluxCoordinator:
 
         This must be called before running training.
         """
+        await self._await_async(self._initialize_impl())
+
+    async def _initialize_impl(self) -> None:
+        """Initialize components on the dedicated async loop."""
         if self._initialized:
             return
 
@@ -240,14 +318,21 @@ class FluxCoordinator:
 
     async def shutdown(self) -> None:
         """Shutdown all components cleanly."""
+        await self._await_async(self._shutdown_impl())
+
+    async def _shutdown_impl(self) -> None:
+        """Shutdown components on the dedicated async loop."""
         logger.info("Shutting down FluxCoordinator...")
 
         # Disconnect SGLang
-        if self._sglang is not None and hasattr(self._sglang, 'disconnect'):
+        if self._sglang is not None and hasattr(self._sglang, 'close'):
             try:
-                await self._sglang.disconnect()
+                await self._sglang.close()
             except Exception as e:
-                logger.warning(f"Error disconnecting SGLang: {e}")
+                logger.warning(f"Error closing SGLang: {e}")
+
+        # Stop the dedicated async loop
+        self._stop_async_loop()
 
         self._initialized = False
         logger.info("FluxCoordinator shutdown complete")
@@ -482,7 +567,7 @@ class FluxCoordinator:
     def _generate_rollouts_sync(self, prompts: list[str]) -> list[Trajectory]:
         """Generate rollouts synchronously.
 
-        Uses asyncio.run or event loop to call async rollout generation.
+        Uses the dedicated async loop to run async rollout generation.
         Falls back to stub if real rollouts not available.
 
         Args:
@@ -494,24 +579,7 @@ class FluxCoordinator:
         if not self._use_real_rollouts or self._rollout_manager is None:
             return self._generate_rollouts_stub(prompts)
 
-        # Run async generation in sync context
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop is not None:
-            # Already in async context - use nest_asyncio pattern or schedule
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(
-                    asyncio.run,
-                    self._generate_rollouts_async(prompts)
-                )
-                return future.result()
-        else:
-            # No running loop - create one
-            return asyncio.run(self._generate_rollouts_async(prompts))
+        return self._run_async(self._generate_rollouts_async_impl(prompts))
 
     def _generate_rollouts_stub(self, prompts: list[str]) -> list[Trajectory]:
         """Generate stub trajectories for testing.
@@ -534,6 +602,10 @@ class FluxCoordinator:
         return trajectories
 
     async def _generate_rollouts_async(self, prompts: list[str]) -> list[Trajectory]:
+        """Generate rollouts asynchronously using the dedicated async loop."""
+        return await self._await_async(self._generate_rollouts_async_impl(prompts))
+
+    async def _generate_rollouts_async_impl(self, prompts: list[str]) -> list[Trajectory]:
         """Generate rollouts asynchronously using StreamingRolloutManager.
 
         Uses APRIL strategy: oversample, abort long-tail, partial reuse.
@@ -658,32 +730,26 @@ class FluxCoordinator:
     def _sync_weights(self) -> None:
         """Synchronize weights to inference servers (sync version).
 
-        Uses asyncio.run to call the async version.
+        Uses the dedicated async loop to call the async version.
         """
         if self._engine is None:
             return
 
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop is not None:
-            # Already in async context - use thread pool
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(
-                    asyncio.run,
-                    self._sync_weights_async()
-                )
-                future.result()
-        else:
-            asyncio.run(self._sync_weights_async())
+        self._run_async(self._sync_weights_async_impl())
 
     async def _sync_weights_async(self) -> None:
+        """Synchronize weights to inference servers via the dedicated async loop."""
+        await self._await_async(self._sync_weights_async_impl())
+
+    async def _sync_weights_async_impl(self) -> None:
         """Synchronize weights to inference servers via SGLangClient.update_weights.
 
-        Pushes model weights to all connected SGLang servers.
+        Uses centralized WeightSyncManager.serialize_for_sync() which handles:
+        - "full": Complete state_dict serialized to bytes
+        - "delta": Only changed parameters since baseline
+        - "per_tensor": Individual tensors with metadata
+
+        All payload formats are serialized to bytes for HTTP transport.
         """
         if self._engine is None:
             return
@@ -697,15 +763,32 @@ class FluxCoordinator:
             state_dict = self._engine.get_state_dict()
             version = self._state.version.version_id
 
-            # Push weights to SGLang server(s)
+            # Use centralized serialization from WeightSyncManager
+            # This handles method selection, delta compression, quantization
+            payload_bytes = self._weight_sync.serialize_for_sync(
+                weights=state_dict,
+                version=version,
+            )
+
+            # Determine sync method
+            method = getattr(self.config.weight_sync, 'method', 'full')
+            if hasattr(method, 'value'):
+                method = method.value
+
+            # Push serialized bytes to SGLang server(s)
             if hasattr(self._sglang, 'update_weights'):
                 success = await self._sglang.update_weights(
-                    weights=state_dict,
+                    weights=payload_bytes,
                     version=version,
                 )
                 if success:
                     self._weight_sync.mark_updated()
-                    logger.info(f"Weights synced to SGLang at version {version}")
+                    if method == "delta":
+                        self._weight_sync.set_baseline(state_dict, version)
+                    logger.info(
+                        f"Weights synced to SGLang at version {version} "
+                        f"(method={method}, {len(payload_bytes)} bytes)"
+                    )
                 else:
                     logger.warning(f"Weight sync to SGLang returned False at version {version}")
             else:

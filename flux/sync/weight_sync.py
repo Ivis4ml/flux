@@ -24,6 +24,12 @@ import torch
 
 from flux.core.config import WeightSyncConfig
 from flux.core.types import PolicyVersion
+from flux.sync.delta_compression import (
+    CompressedDelta,
+    QuantizedEncoder,
+    SnapshotManager,
+    compute_weight_delta,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -85,7 +91,7 @@ class WeightSyncManager:
 
     Example:
         manager = WeightSyncManager(
-            config=WeightSyncConfig(use_delta_compression=True),
+            config=WeightSyncConfig(method="delta"),
             server_urls=["http://localhost:8000", "http://localhost:8001"],
         )
 
@@ -121,9 +127,19 @@ class WeightSyncManager:
         self._server_versions: dict[str, int] = {}  # server_url -> version
         self._weights_dirty = False
 
-        # Snapshots for delta computation
+        # Snapshots for delta computation (legacy)
         self._snapshots: dict[int, dict[str, torch.Tensor]] = {}
         self._snapshot_versions: list[int] = []
+
+        # Snapshot manager for baseline tracking
+        self._snapshot_manager = SnapshotManager(
+            max_snapshots=self.config.max_snapshots,
+            snapshot_interval=self.config.snapshot_interval,
+        )
+
+        # Current baseline for delta computation
+        self._baseline: dict[str, torch.Tensor] | None = None
+        self._baseline_version: int | None = None
 
         # Pending sync requests
         self._pending_syncs: dict[str, SyncRequest] = {}
@@ -150,6 +166,152 @@ class WeightSyncManager:
     def is_dirty(self) -> bool:
         """Whether weights have been updated since last sync."""
         return self._weights_dirty
+
+    def _use_delta_compression(self) -> bool:
+        """Check if delta compression should be used.
+
+        Supports both old (use_delta_compression) and new (method) config styles.
+        """
+        # New style: check method field
+        if hasattr(self.config, 'method'):
+            method = self.config.method
+            if isinstance(method, Enum):
+                method = method.value
+            return method == "delta"
+        # Old style: check use_delta_compression field
+        if hasattr(self.config, 'use_delta_compression'):
+            return self.config.use_delta_compression
+        return False
+
+    def get_baseline(self) -> dict[str, torch.Tensor] | None:
+        """Get current baseline weights for delta computation.
+
+        Returns:
+            Baseline weights or None if not set.
+        """
+        with self._lock:
+            return self._baseline
+
+    def get_baseline_version(self) -> int | None:
+        """Get the version of the current baseline weights."""
+        with self._lock:
+            return self._baseline_version
+
+    def set_baseline(self, weights: dict[str, torch.Tensor], version: int) -> None:
+        """Set baseline weights for delta computation.
+
+        Args:
+            weights: Model state dict to use as baseline.
+            version: Version number for this baseline.
+        """
+        with self._lock:
+            # Clone to CPU to avoid GPU memory issues
+            self._baseline = {k: v.clone().cpu() for k, v in weights.items()}
+            self._baseline_version = version
+            # Also take a snapshot for versioned delta
+            self._snapshot_manager.take_snapshot(weights, version)
+
+    def serialize_for_sync(
+        self,
+        weights: dict[str, torch.Tensor],
+        version: int | None = None,
+    ) -> bytes:
+        """Serialize weights for sync based on configured method.
+
+        This is the centralized serialization point. It handles:
+        - Full: Complete state_dict serialized to bytes
+        - Delta: Only changed parameters since baseline
+        - Per-tensor: Individual tensors with metadata
+
+        The output is always bytes suitable for HTTP transport.
+
+        Args:
+            weights: Current model state dict.
+            version: Weight version (uses current if not provided).
+
+        Returns:
+            Serialized bytes ready for HTTP transport.
+        """
+        import io
+
+        version = version if version is not None else self._current_version
+        method = getattr(self.config, 'method', 'full')
+        if isinstance(method, Enum):
+            method = method.value
+
+        weights_cpu = {k: v.detach().cpu() for k, v in weights.items()}
+        payload: dict[str, Any] = {
+            "version": version,
+            "method": method,
+        }
+
+        if method == "delta":
+            # Delta compression - only changed parameters
+            baseline = self.get_baseline()
+            baseline_version = self.get_baseline_version()
+            if baseline is not None and baseline_version is not None and baseline_version < version:
+                delta = compute_weight_delta(
+                    baseline=baseline,
+                    current=weights_cpu,
+                    from_version=baseline_version,
+                    to_version=version,
+                    threshold=self.config.sparsity_threshold,
+                )
+                payload["weights"] = delta.changed_params
+                payload["from_version"] = delta.from_version
+                payload["baseline_version"] = baseline_version
+                payload["stats"] = {
+                    "changed_params": delta.stats.changed_params,
+                    "total_params": delta.stats.total_params,
+                    "compression_ratio": delta.stats.compression_ratio,
+                }
+                logger.debug(
+                    f"Delta sync: {delta.stats.changed_params}/{delta.stats.total_params} "
+                    f"params changed, {delta.stats.compression_ratio:.1%} ratio"
+                )
+            else:
+                # No baseline, fall back to full
+                payload["weights"] = weights_cpu
+                payload["method"] = "full"
+                logger.debug("No baseline for delta, using full sync")
+
+        elif method == "per_tensor":
+            # Per-tensor with shapes and dtypes for validation
+            tensor_meta = {}
+            for name, tensor in weights_cpu.items():
+                tensor_meta[name] = {
+                    "shape": list(tensor.shape),
+                    "dtype": str(tensor.dtype),
+                    "numel": tensor.numel(),
+                }
+            payload["weights"] = weights_cpu
+            payload["tensor_meta"] = tensor_meta
+
+        else:
+            # Full state_dict (default)
+            payload["weights"] = weights_cpu
+
+        # Apply quantization if configured
+        if getattr(self.config, 'quantize', False):
+            bits = getattr(self.config, 'quantize_bits', 16)
+            encoder = QuantizedEncoder(bits=bits)
+            if "weights" in payload and isinstance(payload["weights"], dict):
+                quantized, scales = encoder.encode_dict(payload["weights"])
+                payload["weights"] = quantized
+                payload["quantization"] = {
+                    "bits": bits,
+                    "scales": scales,
+                }
+                if "tensor_meta" in payload:
+                    for name, meta in payload["tensor_meta"].items():
+                        meta["orig_dtype"] = meta.get("dtype")
+                        meta["dtype"] = str(quantized[name].dtype)
+                logger.debug(f"Applied {bits}-bit quantization")
+
+        # Serialize to bytes using torch.save
+        buffer = io.BytesIO()
+        torch.save(payload, buffer)
+        return buffer.getvalue()
 
     def add_server(self, server_url: str) -> None:
         """Add a server to sync to.
@@ -185,7 +347,7 @@ class WeightSyncManager:
             self._metrics.last_sync_version = self._current_version
 
             # Take snapshot if needed for delta compression
-            if self.config.use_delta_compression:
+            if self._use_delta_compression():
                 self._maybe_take_snapshot()
 
             return self._current_version
@@ -266,7 +428,7 @@ class WeightSyncManager:
                 return True  # Already up to date
 
         strategy = strategy or SyncStrategy.FULL
-        if self.config.use_delta_compression:
+        if self._use_delta_compression():
             strategy = SyncStrategy.DELTA
 
         start_time = time.time()

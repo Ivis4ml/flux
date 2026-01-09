@@ -189,8 +189,8 @@ class FluxTrainer:
             reward_function=self._reward_function,
         )
 
-        # Initialize coordinator with notebook-friendly event loop handling
-        self._run_async(self._coordinator.initialize())
+        # Initialize coordinator using its dedicated async loop
+        self._coordinator._run_async(self._coordinator.initialize())
 
         # Add step callbacks to coordinator
         for callback in self._step_callbacks:
@@ -224,7 +224,7 @@ class FluxTrainer:
         logger.info("Tearing down FluxTrainer...")
 
         if self._coordinator is not None:
-            self._run_async(self._coordinator.shutdown())
+            self._coordinator._run_async(self._coordinator.shutdown())
             self._coordinator = None
 
         if self._logger is not None:
