@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, AsyncIterator, Callable, Iterator
 
 from flux.controller.adaptive_async import AdaptiveAsyncScheduler
 from flux.core.config import FluxConfig
@@ -656,16 +656,33 @@ class FluxCoordinator:
         if self._reward_fn is None:
             return trajectories
 
+        failed_count = 0
         for traj in trajectories:
             try:
                 output = self._reward_fn(traj)
                 traj.reward = output.reward
                 traj.token_rewards = output.token_rewards
             except Exception as e:
-                logger.warning(f"Reward computation failed: {e}")
+                failed_count += 1
+                logger.warning(
+                    f"Reward computation failed for trajectory {traj.id}: {e}. "
+                    "Setting reward to 0.0 (this may affect training stability)."
+                )
                 traj.reward = 0.0
+                # Store failure info in metadata for debugging
+                traj.metadata["reward_computation_failed"] = True
+                traj.metadata["reward_computation_error"] = str(e)
 
             self._state.rewards_sum += traj.reward
+
+        if failed_count > 0:
+            failure_rate = failed_count / len(trajectories)
+            if failure_rate > 0.1:  # More than 10% failures
+                logger.error(
+                    f"High reward computation failure rate: {failure_rate:.1%} "
+                    f"({failed_count}/{len(trajectories)} trajectories). "
+                    "Check reward function configuration."
+                )
 
         return trajectories
 
@@ -901,7 +918,3 @@ class FluxCoordinator:
         }
 
         return stats
-
-
-# Type hint for async iterator
-from typing import AsyncIterator

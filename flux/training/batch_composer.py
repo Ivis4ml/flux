@@ -26,7 +26,7 @@ class LengthBucket:
     """A bucket for trajectories of similar length."""
 
     min_length: int
-    max_length: int
+    max_length: int | float  # Can be float("inf") for unbounded upper limit
     trajectories: list[Trajectory] = field(default_factory=list)
 
     @property
@@ -57,7 +57,7 @@ class StalenessStratum:
     """A stratum for trajectories with similar staleness."""
 
     min_staleness: int
-    max_staleness: int
+    max_staleness: int | float  # Can be float("inf") for unbounded upper limit
     trajectories: list[Trajectory] = field(default_factory=list)
 
     @property

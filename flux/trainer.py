@@ -496,36 +496,68 @@ class FluxTrainer:
 
         return stats
 
-    def _prepare_prompts(self, prompts: PromptsType) -> list[str]:
-        """Convert prompts to list of strings.
+    def _prepare_prompts(
+        self,
+        prompts: PromptsType,
+        max_prompt_length: int = 32768,
+        max_prompts: int | None = None,
+    ) -> list[str]:
+        """Convert prompts to list of strings with validation.
 
         Args:
             prompts: Prompts in various formats.
+            max_prompt_length: Maximum allowed length per prompt (chars).
+            max_prompts: Maximum number of prompts to process (None for unlimited).
 
         Returns:
-            List of prompt strings.
+            List of validated prompt strings.
+
+        Raises:
+            ValueError: If a prompt exceeds max_prompt_length.
         """
         if prompts is None:
             return []
 
+        result: list[str] = []
+
+        def validate_and_add(prompt_str: str) -> None:
+            """Validate and add a single prompt."""
+            if max_prompts is not None and len(result) >= max_prompts:
+                return
+
+            # Validate length
+            if len(prompt_str) > max_prompt_length:
+                logger.warning(
+                    f"Prompt exceeds max length ({len(prompt_str)} > {max_prompt_length}), "
+                    "truncating"
+                )
+                prompt_str = prompt_str[:max_prompt_length]
+
+            # Basic sanitization - strip leading/trailing whitespace
+            prompt_str = prompt_str.strip()
+
+            if prompt_str:  # Only add non-empty prompts
+                result.append(prompt_str)
+
         if isinstance(prompts, list):
             # Handle list of strings or dicts
-            result = []
             for p in prompts:
                 if isinstance(p, str):
-                    result.append(p)
+                    validate_and_add(p)
                 elif isinstance(p, dict):
                     # Extract prompt from dict (common Dataset format)
-                    result.append(p.get("prompt", p.get("text", str(p))))
+                    prompt_str = p.get("prompt", p.get("text", str(p)))
+                    validate_and_add(str(prompt_str))
                 else:
-                    result.append(str(p))
+                    validate_and_add(str(p))
             return result
 
         # Handle Dataset-like objects
         if hasattr(prompts, "__iter__"):
-            return self._prepare_prompts(list(prompts))
+            return self._prepare_prompts(list(prompts), max_prompt_length, max_prompts)
 
-        return [str(prompts)]
+        validate_and_add(str(prompts))
+        return result
 
     def _log_step(self, step_result: StepResult) -> None:
         """Log step metrics.

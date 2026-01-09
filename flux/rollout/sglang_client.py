@@ -376,10 +376,16 @@ class SGLangClient:
                     raise
                 logger.warning(f"HTTP error {e.response.status_code}, retrying ({attempt + 1}/{self.config.max_retries})")
                 await asyncio.sleep(1.0)
-            except (httpx.RequestError, Exception) as e:
+            except httpx.RequestError as e:
                 if attempt == self.config.max_retries:
                     raise
                 logger.warning(f"Request error: {e}, retrying ({attempt + 1}/{self.config.max_retries})")
+                await asyncio.sleep(1.0)
+            except (httpx.TimeoutException, ConnectionError, OSError) as e:
+                # Handle network-level errors specifically
+                if attempt == self.config.max_retries:
+                    raise
+                logger.warning(f"Network error: {e}, retrying ({attempt + 1}/{self.config.max_retries})")
                 await asyncio.sleep(1.0)
 
         end_time = time.time()
