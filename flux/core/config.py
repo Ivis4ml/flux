@@ -83,6 +83,12 @@ class AdaptiveAsyncConfig(BaseConfig):
     The controller dynamically adjusts sync/async ratio based on measured staleness,
     using a PID controller for smooth adaptation.
 
+    The async_ratio (float in [min_async_ratio, max_async_ratio]) controls the
+    maximum proportion of off-policy data allowed in training batches:
+    - 0.1 (more sync): Sync barrier triggered frequently; training waits for fresh rollouts
+    - 0.5 (balanced): Mixed fresh/stale data; moderate overlap between rollout and training
+    - 0.9 (more async): Training proceeds with older data; rollouts run independently
+
     Attributes:
         target_staleness: Target staleness level (0 = fully sync, 1 = very stale).
         tolerance: Acceptable deviation from target staleness before triggering sync.
@@ -91,12 +97,14 @@ class AdaptiveAsyncConfig(BaseConfig):
         kp: Proportional gain for PID controller.
         ki: Integral gain for PID controller.
         kd: Derivative gain for PID controller.
-        staleness_decay: Exponential decay factor for staleness correction.
         kl_normalizer: Normalization factor for KL divergence in staleness computation.
         iw_normalizer: Normalization factor for importance weight variance.
         max_version_gap: Maximum expected version gap for normalization.
+        kl_weight: Weight for KL contribution in combined staleness (default 0.4).
+        iw_weight: Weight for IW variance contribution in combined staleness (default 0.3).
+        version_weight: Weight for version gap contribution in combined staleness (default 0.3).
         max_steps_without_sync: Force sync after this many steps.
-        ema_alpha: Smoothing factor for exponential moving average.
+        ema_alpha: Smoothing factor for exponential moving average of staleness.
     """
 
     target_staleness: float = Field(default=0.15, ge=0.0, le=1.0)
@@ -109,11 +117,15 @@ class AdaptiveAsyncConfig(BaseConfig):
     ki: float = Field(default=0.01, ge=0.0)
     kd: float = Field(default=0.05, ge=0.0)
 
-    # Staleness computation
-    staleness_decay: float = Field(default=0.95, ge=0.0, le=1.0)
+    # Staleness computation normalization
     kl_normalizer: float = Field(default=0.1, gt=0.0)
     iw_normalizer: float = Field(default=2.0, gt=0.0)
     max_version_gap: int = Field(default=5, ge=1)
+
+    # Staleness combination weights (must sum to 1.0)
+    kl_weight: float = Field(default=0.4, ge=0.0, le=1.0)
+    iw_weight: float = Field(default=0.3, ge=0.0, le=1.0)
+    version_weight: float = Field(default=0.3, ge=0.0, le=1.0)
 
     # Sync control
     max_steps_without_sync: int = Field(default=50, ge=1)
@@ -121,25 +133,39 @@ class AdaptiveAsyncConfig(BaseConfig):
 
     @model_validator(mode="after")
     def validate_ratios(self) -> "AdaptiveAsyncConfig":
-        """Ensure min_async_ratio <= max_async_ratio."""
+        """Ensure min_async_ratio <= max_async_ratio and weights sum to 1.0."""
         if self.min_async_ratio > self.max_async_ratio:
             raise ValueError("min_async_ratio must be <= max_async_ratio")
+        weight_sum = self.kl_weight + self.iw_weight + self.version_weight
+        if abs(weight_sum - 1.0) > 0.01:
+            raise ValueError(f"Staleness weights must sum to 1.0, got {weight_sum}")
         return self
 
 
 class RolloutConfig(BaseConfig):
     """Configuration for rollout generation.
 
+    APRIL Strategy Parameters:
+    - oversample_ratio: Generate more prompts than needed to buffer against long-tail
+    - batch_timeout: After timeout, abort remaining and yield completed
+    - partial_reuse_threshold: If this fraction of max_tokens generated, save prefix
+
+    Abort Rule: A generation is aborted when:
+    - elapsed_time > batch_timeout, AND
+    - completed_count >= target_count
+
     Attributes:
         max_tokens: Maximum tokens to generate per response.
         temperature: Sampling temperature.
         top_p: Nucleus sampling parameter.
         top_k: Top-k sampling parameter.
-        oversample_ratio: Ratio of extra prompts to sample for APRIL strategy.
+        oversample_ratio: Ratio of extra prompts to sample for APRIL strategy (default 1.5).
         min_yield_size: Minimum batch size before yielding trajectories.
-        batch_timeout: Timeout in seconds for batch completion.
+        batch_timeout: Timeout in seconds for batch completion (default 30s).
         use_length_prediction: Whether to use length prediction for scheduling.
-        partial_reuse_threshold: Minimum partial trajectory length to save for reuse.
+        partial_reuse_threshold: Fraction of max_tokens to save as partial (default 0.5).
+        partial_buffer_max_factor: Partial buffer max size as factor of batch_size (default 2).
+        oversample_pool_max_factor: Oversample pool max size as factor of prompt queue (default 1.5).
     """
 
     max_tokens: int = Field(default=2048, ge=1, le=32768)
@@ -154,11 +180,32 @@ class RolloutConfig(BaseConfig):
 
     # Length prediction
     use_length_prediction: bool = Field(default=True)
-    partial_reuse_threshold: int = Field(default=64, ge=0)
+
+    # Partial trajectory reuse
+    partial_reuse_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    partial_buffer_max_factor: float = Field(default=2.0, ge=1.0)
+    oversample_pool_max_factor: float = Field(default=1.5, ge=1.0)
+
+    def get_min_partial_tokens(self) -> int:
+        """Get minimum tokens for partial trajectory reuse."""
+        return int(self.max_tokens * self.partial_reuse_threshold)
 
 
 class BatchComposerConfig(BaseConfig):
     """Configuration for smart batch composition.
+
+    Length Bucketing:
+    - Buckets: [0, 512), [512, 1024), [1024, 2048), [2048, ∞)
+    - Trajectories grouped by bucket; batches drawn from single bucket
+
+    Staleness Balancing:
+    - Stratified sampling by version_gap buckets
+    - Sample proportionally from each stratum to balance batch
+
+    Curriculum Ordering:
+    - Difficulty signal: length + reward based heuristic (configurable)
+    - Early training: randomness = 1.0 (fully shuffled)
+    - Late training: randomness → 0 (strict easy→hard ordering)
 
     Attributes:
         use_length_bucketing: Whether to group by length for efficient padding.
@@ -166,16 +213,55 @@ class BatchComposerConfig(BaseConfig):
         use_curriculum: Whether to use curriculum learning ordering.
         length_bucket_boundaries: Token count boundaries for length buckets.
         staleness_strata: Number of staleness strata for stratified sampling.
-        curriculum_randomness_decay: How fast to reduce curriculum randomness.
+        curriculum_randomness_decay: Decay rate for curriculum randomness.
     """
 
     use_length_bucketing: bool = Field(default=True)
     use_staleness_balancing: bool = Field(default=True)
     use_curriculum: bool = Field(default=True)
 
+    # Creates buckets: [0, 512), [512, 1024), [1024, 2048), [2048, ∞)
     length_bucket_boundaries: tuple[int, ...] = Field(default=(512, 1024, 2048))
-    staleness_strata: int = Field(default=5, ge=1)
+
+    # Strata: version_gap 0, 1, 2, 3+ (4 strata total)
+    staleness_strata: int = Field(default=4, ge=1)
+
+    # randomness = 1 / (1 + decay_rate × curriculum_step)
     curriculum_randomness_decay: float = Field(default=1.0, ge=0.0)
+
+
+class ImportanceCorrectionConfig(BaseConfig):
+    """Configuration for unified importance weight correction.
+
+    Importance correction adjusts for distribution shift between behavior policy
+    (which generated the data) and current policy (being trained). This enables
+    off-policy learning with staleness-aware weighting.
+
+    Formula:
+        log_ratio = current_logprobs - behavior_logprobs
+        mean_log_ratio = mean(log_ratio * mask)
+        base_weight = exp(clip(mean_log_ratio, log_clip_min, log_clip_max))
+        staleness_weight = staleness_decay ** version_gap
+        importance_weight = clip(base_weight * staleness_weight, weight_min, weight_max)
+        importance_weight = importance_weight * (batch_size / sum(importance_weight))
+
+    Attributes:
+        enabled: Whether to apply importance correction.
+        staleness_decay: Decay factor per version gap (default 0.99).
+        weight_min: Minimum importance weight (default 0.2).
+        weight_max: Maximum importance weight (default 5.0).
+        log_clip_min: Minimum log ratio before exp (default -20).
+        log_clip_max: Maximum log ratio before exp (default 20).
+        normalize: Whether to normalize weights to preserve gradient scale.
+    """
+
+    enabled: bool = Field(default=True)
+    staleness_decay: float = Field(default=0.99, ge=0.0, le=1.0)
+    weight_min: float = Field(default=0.2, ge=0.0)
+    weight_max: float = Field(default=5.0, gt=0.0)
+    log_clip_min: float = Field(default=-20.0)
+    log_clip_max: float = Field(default=20.0)
+    normalize: bool = Field(default=True)
 
 
 class WeightSyncConfig(BaseConfig):
@@ -385,6 +471,9 @@ class FluxConfig(BaseConfig):
     rollout: RolloutConfig = Field(default_factory=RolloutConfig)
     batch_composer: BatchComposerConfig = Field(default_factory=BatchComposerConfig)
     weight_sync: WeightSyncConfig = Field(default_factory=WeightSyncConfig)
+    importance_correction: ImportanceCorrectionConfig = Field(
+        default_factory=ImportanceCorrectionConfig
+    )
     algorithm: AlgorithmConfig = Field(default_factory=AlgorithmConfig)
     reward: RewardConfig = Field(default_factory=RewardConfig)
     sglang: SGLangConfig = Field(default_factory=SGLangConfig)

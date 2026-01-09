@@ -318,8 +318,9 @@ class StreamingRolloutManager:
 
             if result.status == GenerationStatus.ABORTED:
                 aborted += 1
-                # Save as partial if long enough
-                if len(result.tokens) >= self.config.partial_reuse_threshold:
+                # Save as partial if long enough (using ratio-based threshold)
+                min_tokens = self.config.get_min_partial_tokens()
+                if len(result.tokens) >= min_tokens:
                     partial = self._create_partial_trajectory(request, result, version)
                     partial_trajectories.append(partial)
                     self._partial_buffer.append(partial)

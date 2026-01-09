@@ -167,35 +167,71 @@ class StalenessMetrics:
 
     Staleness indicates how much the policy has changed since the data was generated.
     High staleness may require importance weight correction or sync barriers.
+
+    Signal Definitions:
+    - KL Divergence: D_KL(π_behavior || π_current), token-level, averaged over response tokens.
+      Unit: nats. Danger threshold: > 0.1
+    - IW Variance: Var(w) where w = exp(mean_token(log π_current - log π_behavior)).
+      Per-trajectory, then variance across batch. Unit: unitless. Danger threshold: > 2.0
+    - Version Gap: current_version - trajectory_version.
+      Per-trajectory, averaged over batch. Unit: integer (steps). Danger threshold: > 5
+
+    Combined staleness formula:
+        kl_contrib = min(1, kl_divergence / kl_normalizer)
+        iw_contrib = min(1, iw_variance / iw_normalizer)
+        version_contrib = min(1, version_gap / max_version_gap)
+        combined = kl_weight * kl_contrib + iw_weight * iw_contrib + version_weight * version_contrib
     """
 
     # Individual staleness components
-    kl_divergence: float = 0.0           # KL(π_current || π_behavior)
-    importance_weight_variance: float = 0.0  # Var(π_current/π_behavior)
-    version_gap: float = 0.0             # current_version - data_version
+    kl_divergence: float = 0.0           # KL(π_behavior || π_current), token-level averaged
+    importance_weight_variance: float = 0.0  # Var(w) where w = π_current/π_behavior
+    version_gap: float = 0.0             # current_version - data_version, averaged over batch
 
     # Combined staleness score [0, 1]
     combined_staleness: float = 0.0
 
-    # Normalization factors (for computing combined)
-    kl_normalizer: float = 0.1
-    iw_normalizer: float = 2.0
-    max_version_gap: int = 5
+    # Normalization factors (danger thresholds)
+    kl_normalizer: float = 0.1           # KL danger threshold
+    iw_normalizer: float = 2.0           # IW variance danger threshold
+    max_version_gap: int = 5             # Version gap danger threshold
 
-    def compute_combined(self) -> float:
+    # Combination weights (default: 0.4, 0.3, 0.3, must sum to 1.0)
+    kl_weight: float = 0.4
+    iw_weight: float = 0.3
+    version_weight: float = 0.3
+
+    def compute_combined(
+        self,
+        kl_weight: float | None = None,
+        iw_weight: float | None = None,
+        version_weight: float | None = None,
+    ) -> float:
         """Compute combined staleness from components.
 
-        Uses weighted combination:
-        staleness = 0.4 * kl + 0.3 * iw_var + 0.3 * version_gap
+        Args:
+            kl_weight: Override for KL contribution weight.
+            iw_weight: Override for IW variance contribution weight.
+            version_weight: Override for version gap contribution weight.
+
+        Returns:
+            Combined staleness score in [0, 1].
         """
+        # Use provided weights or defaults
+        kl_w = kl_weight if kl_weight is not None else self.kl_weight
+        iw_w = iw_weight if iw_weight is not None else self.iw_weight
+        ver_w = version_weight if version_weight is not None else self.version_weight
+
+        # Normalize each component to [0, 1]
         kl_contrib = min(1.0, self.kl_divergence / self.kl_normalizer)
         iw_contrib = min(1.0, self.importance_weight_variance / self.iw_normalizer)
         version_contrib = min(1.0, self.version_gap / self.max_version_gap)
 
+        # Weighted sum
         self.combined_staleness = (
-            0.4 * kl_contrib +
-            0.3 * iw_contrib +
-            0.3 * version_contrib
+            kl_w * kl_contrib +
+            iw_w * iw_contrib +
+            ver_w * version_contrib
         )
         return self.combined_staleness
 

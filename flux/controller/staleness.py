@@ -62,16 +62,23 @@ class StalenessManager:
     2. Rolling statistics for adaptive control
     3. Capacity for staleness-aware async scheduling
 
-    Staleness Formula:
-        combined = 0.4 * kl_contrib + 0.3 * iw_contrib + 0.3 * version_contrib
+    Signal Definitions:
+    - KL Divergence: D_KL(π_behavior || π_current), token-level averaged. Danger threshold: > 0.1
+    - IW Variance: Var(w) where w = π_current/π_behavior, per-trajectory then batch. Danger: > 2.0
+    - Version Gap: current_version - trajectory_version, averaged. Danger threshold: > 5
 
-    Where each component is normalized to [0, 1]:
-        - kl_contrib = min(1, kl_divergence / kl_normalizer)
-        - iw_contrib = min(1, iw_variance / iw_normalizer)
-        - version_contrib = min(1, version_gap / max_version_gap)
+    Staleness Formula (with configurable weights from AdaptiveAsyncConfig):
+        kl_contrib = min(1, kl_divergence / kl_normalizer)       # default kl_normalizer = 0.1
+        iw_contrib = min(1, iw_variance / iw_normalizer)         # default iw_normalizer = 2.0
+        version_contrib = min(1, version_gap / max_version_gap)  # default max_version_gap = 5
+
+        combined = kl_weight * kl_contrib + iw_weight * iw_contrib + version_weight * version_contrib
+        # default weights: 0.4, 0.3, 0.3 (configurable in AdaptiveAsyncConfig)
+
+    The combined staleness is smoothed via EMA (alpha=0.1) before being used.
 
     Capacity is computed to ensure rollouts won't be too stale when consumed:
-        capacity = (max_staleness + current_version + 1) * batch_size - in_flight
+        capacity = (max_version_gap + current_version + 1) * batch_size - in_flight
 
     Example:
         manager = StalenessManager(
@@ -172,6 +179,10 @@ class StalenessManager:
             kl_normalizer=self.config.kl_normalizer,
             iw_normalizer=self.config.iw_normalizer,
             max_version_gap=self.config.max_version_gap,
+            # Use configurable weights from config
+            kl_weight=self.config.kl_weight,
+            iw_weight=self.config.iw_weight,
+            version_weight=self.config.version_weight,
         )
 
         # Extract values from batch_metrics if provided
@@ -192,7 +203,7 @@ class StalenessManager:
         if version_gap is not None:
             metrics.version_gap = version_gap
 
-        # Compute combined staleness
+        # Compute combined staleness using configurable weights
         metrics.compute_combined()
 
         # Update EMA and history

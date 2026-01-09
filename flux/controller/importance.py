@@ -23,6 +23,19 @@ from flux.core.types import PolicyVersion
 class ImportanceCorrectionConfig:
     """Configuration for importance correction.
 
+    Formula (per-trajectory):
+        log_ratio = current_logprobs - behavior_logprobs         # [seq_len]
+        mean_log_ratio = (log_ratio * mask).sum() / seq_len      # scalar
+        base_weight = exp(clip(mean_log_ratio, -20, 20))         # scalar
+
+        staleness_weight = staleness_decay ** version_gap        # default decay = 0.99
+
+        importance_weight = base_weight * staleness_weight
+        importance_weight = clip(importance_weight, min=0.2, max=5.0)
+
+        # Normalize to preserve gradient scale
+        importance_weight = importance_weight * (batch_size / sum(importance_weight))
+
     Attributes:
         staleness_decay: Decay factor per version gap (default: 0.99)
         max_importance_weight: Maximum importance weight for clipping (default: 5.0)
