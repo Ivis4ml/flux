@@ -1,53 +1,49 @@
-# Flux
+<div align="center">
 
-```
-███████╗██╗     ██╗   ██╗██╗  ██╗
-██╔════╝██║     ██║   ██║╚██╗██╔╝
-█████╗  ██║     ██║   ██║ ╚███╔╝
-██╔══╝  ██║     ██║   ██║ ██╔██╗
-██║     ███████╗╚██████╔╝██╔╝ ██╗
-╚═╝     ╚══════╝ ╚═════╝ ╚═╝  ╚═╝
-```
+<img src="docs/flux-concept.png" alt="Flux" width="320">
 
-**Adaptive Post-Training Framework for LLMs**
+<h2>Adaptive Post-Training Framework for LLMs</h2>
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-
-> **The best of all worlds** — Synchronous stability + Asynchronous efficiency + Native simplicity
-
-<p align="center">
-  <a href="#installation">Installation</a> •
-  <a href="#quick-start">Quick Start</a> •
-  <a href="#key-features">Features</a> •
-  <a href="#architecture">Architecture</a> •
-  <a href="docs/flux-design-spec.md">Design Doc</a>
+<p>
+<strong>The best of all worlds</strong> — Synchronous stability + Asynchronous efficiency + Native simplicity
 </p>
+
+<p>
+<a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
+<a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+"></a>
+<a href="https://github.com/flux-team/flux/stargazers"><img src="https://img.shields.io/github/stars/flux-team/flux" alt="GitHub Stars"></a>
+</p>
+
+<p>
+<a href="#installation">Installation</a> •
+<a href="#quick-start">Quick Start</a> •
+<a href="#key-features">Features</a> •
+<a href="#architecture">Architecture</a> •
+<a href="docs/flux-design-spec.md">Design Doc</a>
+</p>
+
+</div>
 
 ---
 
-## Why Flux?
+## Overview
 
-Existing RLHF frameworks force a binary choice between stability and throughput:
+Flux is a flexible and efficient reinforcement learning framework for LLM post-training (RLHF). Unlike existing frameworks that force a binary choice between synchronous stability and asynchronous throughput, **Flux adaptively adjusts the sync/async ratio in real-time** based on measured staleness.
+
+**Key Insight**: Sync vs Async is NOT a binary choice. Flux operates anywhere on this spectrum, adapting in real-time to maximize both stability and throughput.
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                                                                │
-│   VERL        ████████████░░░░░░░░░░░░░░░░░░  Stable but slow │
-│   AReaL       ░░░░░░░░░░░░░░░░░░████████████  Fast but risky  │
-│                                                                │
-│   Flux        ████████████████████████████░░  Best of both    │
-│                                                                │
-│               ◄── Sync ─────────────────── Async ──►          │
-│                                                                │
-│   Key Insight: Sync vs Async is NOT a binary choice           │
-│   Flux adapts the ratio in real-time based on staleness       │
-│                                                                │
-└────────────────────────────────────────────────────────────────┘
+Sync ◄────────────────────────────────────────────────────► Async
+
+     VERL        ████████████░░░░░░░░░░░░░░░░░░  Stable but slow
+     AReaL       ░░░░░░░░░░░░░░░░░░████████████  Fast but risky
+     Flux        ◄═══════ adapts here ═══════►  Best of both
 ```
+
+## Comparison
 
 | Aspect | VERL | AReaL | Slime | **Flux** |
-|--------|------|-------|-------|----------|
+|:-------|:----:|:-----:|:-----:|:--------:|
 | Sync Strategy | Fixed sync | Fixed async | Both | **Adaptive** |
 | Orchestration | Ray | Custom | HTTP | **asyncio** |
 | Training Backend | Megatron/FSDP | Custom | Megatron | **Megatron** |
@@ -58,16 +54,68 @@ Existing RLHF frameworks force a binary choice between stability and throughput:
 
 ---
 
+## Key Features
+
+### Adaptive Async Control
+
+Flux uses a PID controller to dynamically adjust the sync/async ratio based on measured staleness:
+
+- **Early training**: More synchronous (policy changing rapidly)
+- **Late training**: More asynchronous (policy stable, maximize throughput)
+
+The controller monitors three staleness signals: KL divergence, importance weight variance, and version gap.
+
+### APRIL Strategy
+
+Active Partial Rollout for efficient generation:
+
+| Step | Description |
+|:-----|:------------|
+| **Oversample** | Generate 1.5× prompts to have buffer |
+| **Abort** | Cancel long-tail generations after timeout |
+| **Reuse** | Save partial trajectories for continuation |
+
+### Smart Batch Composition
+
+- **Length bucketing** — Group similar lengths to minimize padding
+- **Staleness balancing** — Stratified sampling to reduce importance weight variance
+- **Curriculum ordering** — Easy → hard progression as training proceeds
+
+### Zero-Copy Weight Sync
+
+CUDA IPC for same-node weight transfer between Megatron and SGLang:
+- No serialization overhead
+- Delta compression for incremental updates
+- Lazy sync (only when inference needs fresh weights)
+
+---
+
+## Supported Algorithms
+
+| Algorithm | Type | Description |
+|:----------|:-----|:------------|
+| **PPO** | On-policy | Clipped surrogate objective |
+| **GRPO** | On-policy | Group Relative Policy Optimization (default) |
+| **DPO** | Preference | Direct Preference Optimization |
+| **REINFORCE** | On-policy | Basic policy gradient |
+| **DAPO** | On-policy | Decoupled clip and dynamic sampling |
+| **GSPO** | On-policy | Group Stability Policy Optimization |
+| **RLOO** | On-policy | Leave-One-Out baseline estimator |
+
+All algorithms benefit from Flux's unified importance correction for off-policy data.
+
+---
+
 ## Installation
 
 ### Prerequisites
 
 - Python 3.10+
 - CUDA 12.0+ with NCCL
-- [SGLang](https://github.com/sgl-project/sglang) server running
+- [SGLang](https://github.com/sgl-project/sglang) server
 - [Megatron-LM](https://github.com/NVIDIA/Megatron-LM) (for distributed training)
 
-### Install from source
+### Install from Source
 
 ```bash
 git clone https://github.com/flux-team/flux.git
@@ -79,7 +127,7 @@ pip install -e .
 # With development dependencies
 pip install -e ".[dev]"
 
-# Full installation (includes SGLang and Megatron dependencies)
+# Full installation (includes all dependencies)
 pip install -e ".[all]"
 ```
 
@@ -87,101 +135,39 @@ pip install -e ".[all]"
 
 ## Quick Start
 
-### 1. Start SGLang server
+### 1. Start SGLang Server
 
 ```bash
 python -m sglang.launch_server --model-path Qwen/Qwen3-8B --port 8000
 ```
 
-### 2. Run training
+### 2. Run Training
 
 ```python
 from flux import FluxTrainer, FluxConfig, AdaptiveAsyncConfig, SGLangConfig
 
-# Configure Flux
 config = FluxConfig(
     model_path="Qwen/Qwen3-8B",
-
-    # SGLang inference server
     sglang=SGLangConfig(base_url="http://localhost:8000"),
-
-    # Adaptive async settings
     adaptive_async=AdaptiveAsyncConfig(
-        target_staleness=0.15,  # Flux maintains this staleness level
-        min_async_ratio=0.1,    # Never fully sync (wastes GPU)
-        max_async_ratio=0.9,    # Never fully async (unstable)
+        target_staleness=0.15,
+        min_async_ratio=0.1,
+        max_async_ratio=0.9,
     ),
-
-    # Training settings
     learning_rate=1e-6,
     batch_size=32,
     num_steps=10000,
 )
 
-# Train
 trainer = FluxTrainer(config)
 trainer.fit(prompts, eval_prompts=eval_prompts)
 ```
 
-### 3. Using YAML configuration
+### 3. Using YAML Configuration
 
 ```bash
-# Train with config file
 flux train --config configs/qwen3-8b-8gpu.yaml --prompts data/prompts.jsonl
 ```
-
----
-
-## Key Features
-
-### Adaptive Async Control
-
-Flux uses a PID controller to dynamically adjust the sync/async ratio based on measured staleness:
-
-```
-                    Staleness Measurement
-                            │
-            ┌───────────────┼───────────────┐
-            │               │               │
-        KL Divergence   IW Variance    Version Gap
-            │               │               │
-            └───────────────┼───────────────┘
-                            │
-                            ▼
-                    ┌───────────────┐
-                    │ PID Controller │
-                    │   target=0.15  │
-                    └───────┬───────┘
-                            │
-                            ▼
-                     Async Ratio
-                   (0.1 → 0.9)
-```
-
-- **Early training**: More sync (policy changing rapidly)
-- **Late training**: More async (policy stable, maximize throughput)
-
-### APRIL Strategy
-
-Active Partial Rollout for efficient generation:
-
-1. **Oversample**: Generate 1.5x prompts to have buffer
-2. **Abort**: Cancel long-tail generations after timeout
-3. **Reuse**: Save partial trajectories for continuation
-
-### Smart Batch Composition
-
-Optimized training batches with:
-- **Length bucketing**: Group similar lengths to minimize padding
-- **Staleness balancing**: Stratified sampling to reduce importance weight variance
-- **Curriculum ordering**: Easy → hard progression as training proceeds
-
-### Zero-Copy Weight Sync
-
-CUDA IPC for same-node weight transfer between Megatron and SGLang:
-- No serialization overhead
-- Delta compression for incremental updates
-- Lazy sync (only when inference needs fresh weights)
 
 ---
 
@@ -194,7 +180,6 @@ CUDA IPC for same-node weight transfer between Megatron and SGLang:
 │                                                                 │
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │           Layer 3: Adaptive Control Plane                 │  │
-│  │                                                           │  │
 │  │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐         │  │
 │  │  │  Adaptive   │ │   Smart     │ │  Staleness  │         │  │
 │  │  │   Async     │ │   Batch     │ │   Monitor   │         │  │
@@ -206,10 +191,6 @@ CUDA IPC for same-node weight transfer between Megatron and SGLang:
 │  ┌─────────────────────────▼─────────────────────────────────┐  │
 │  │          Layer 2: Lightweight Coordinator                 │  │
 │  │                  (asyncio + ZeroMQ)                       │  │
-│  │                                                           │  │
-│  │  • Async event loop for non-blocking orchestration        │  │
-│  │  • Weight sync scheduling                                 │  │
-│  │  • Checkpoint management                                  │  │
 │  └─────────────────────────┬─────────────────────────────────┘  │
 │                            │                                    │
 │            ┌───────────────┴───────────────┐                    │
@@ -218,95 +199,35 @@ CUDA IPC for same-node weight transfer between Megatron and SGLang:
 │  │   Layer 1a:       │           │   Layer 1b:       │          │
 │  │   Megatron-LM     │◄─────────►│   SGLang          │          │
 │  │   (Training)      │ CUDA IPC  │   (Inference)     │          │
-│  │                   │ Zero-Copy │                   │          │
-│  │  • 3D Parallelism │           │  • Continuous     │          │
-│  │  • Mixed Precision│           │    Batching       │          │
-│  │  • Grad Ckpt      │           │  • RadixAttention │          │
 │  └───────────────────┘           └───────────────────┘          │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Training Step Flow
-
-```
-1. Coordinator requests rollouts → SGLang generates (streaming)
-                                          │
-2. As responses complete ─────────────────┴──► Data Buffer
-                                                    │
-3. Adaptive Controller monitors staleness ◄─────────┤
-   │                                                │
-   ├─ Staleness LOW:  continue async, request more  │
-   └─ Staleness HIGH: trigger sync barrier          │
-                                                    │
-4. Smart Batch Composer creates training batch ◄────┘
-   │
-   ├─► Group by length (reduce padding)
-   ├─► Balance staleness (stratified sampling)
-   └─► Curriculum ordering (easy → hard)
-                │
-5. Megatron executes training step
-   │
-   ├─► Importance-corrected loss
-   ├─► Gradient accumulation + sync
-   └─► Optimizer step
-                │
-6. Weight Sync Manager updates SGLang (lazy, delta-compressed)
-```
-
----
-
-## Project Structure
+### Project Structure
 
 ```
 flux/
 ├── core/                    # Core abstractions
 │   ├── config.py           # Pydantic configuration classes
-│   ├── types.py            # Type definitions (AsyncDecision, BatchMetrics, etc.)
+│   ├── types.py            # Type definitions
 │   └── trajectory.py       # Trajectory data structures
-│
 ├── controller/              # Adaptive control plane
 │   ├── adaptive_async.py   # PID-based async ratio controller
-│   ├── staleness.py        # Staleness measurement (KL, IW variance, version gap)
-│   └── importance.py       # Unified importance weight correction
-│
+│   ├── staleness.py        # Staleness measurement
+│   └── importance.py       # Importance weight correction
 ├── rollout/                 # Rollout generation
-│   ├── manager.py          # Streaming rollout with APRIL strategy
-│   ├── sglang_client.py    # SGLang HTTP client
-│   └── length_predictor.py # Output length prediction for scheduling
-│
+│   ├── manager.py          # Streaming rollout with APRIL
+│   └── sglang_client.py    # SGLang HTTP client
 ├── training/                # Training engine
 │   ├── megatron_engine.py  # Megatron-LM integration
 │   ├── batch_composer.py   # Smart batch composition
 │   └── algorithms/         # PPO, GRPO, etc.
-│
 ├── sync/                    # Weight synchronization
-│   ├── weight_sync.py      # Sync manager with lazy updates
-│   ├── cuda_ipc.py         # Zero-copy CUDA IPC transfer
-│   └── delta_compression.py # Sparse delta encoding
-│
+│   ├── weight_sync.py      # Sync manager
+│   └── cuda_ipc.py         # Zero-copy CUDA IPC
 └── coordinator/             # Lightweight coordinator
-    ├── coordinator.py      # Main asyncio coordinator
-    └── checkpoint.py       # Checkpoint management
-```
-
----
-
-## Benchmarks
-
-Target performance on Qwen3-8B with 8x H100:
-
-```
-                    VERL        AReaL       FLUX
-                    ────        ─────       ────
-GPU Utilization     ~45%        ~95%        ~85%
-                    ▓▓▓░░░░░░░  ▓▓▓▓▓▓▓▓▓░  ▓▓▓▓▓▓▓▓░░
-
-Stability           ★★★★★       ★★★☆☆       ★★★★☆
-                    Excellent   Risky       Good
-
-Throughput          1.0x        1.8x        2.0x
-                    ▓▓▓▓░░░░░░  ▓▓▓▓▓▓▓░░░  ▓▓▓▓▓▓▓▓░░
+    └── coordinator.py      # Main asyncio coordinator
 ```
 
 ---
@@ -315,20 +236,13 @@ Throughput          1.0x        1.8x        2.0x
 
 ### 1. Continuous Spectrum, Not Binary Choice
 
-```
-Sync ◄──────────────────────────────────────► Async
-     │                                        │
-     │    Flux operates anywhere on this      │
-     │    spectrum, adapting in real-time     │
-     │                                        │
-     └────────────────────────────────────────┘
-```
+Flux operates anywhere on the sync-async spectrum, adapting in real-time based on training dynamics.
 
 ### 2. Native First
 
-- **Don't wrap Megatron** → Integrate with Megatron-LM directly
-- **Don't wrap SGLang** → Use SGLang's HTTP API
-- **Don't use Ray** → Write simple asyncio Python
+- **Direct Megatron-LM integration** — not wrapped
+- **SGLang HTTP API** — simple and efficient
+- **Pure asyncio** — no Ray abstraction layer
 
 ### 3. Simple > Clever
 
@@ -338,40 +252,43 @@ Sync ◄────────────────────────
 
 ---
 
-## Why Not Ray?
+## Documentation
 
-| Ray Provides | LLM Training Needs | Mismatch |
-|--------------|-------------------|----------|
-| Task scheduling | NCCL collectives | Ray doesn't understand NCCL topology |
-| Actor management | Fine-grained GPU memory | Ray treats GPU as resource count |
-| Flexible placement | Fixed TP/PP/DP config | Changing parallelism requires restart |
-| Object Store | CUDA IPC / NCCL | Ray serialization is slow for large tensors |
-
-Both VERL and Slime bypass Ray for critical paths. If you're bypassing the framework, why use it?
+| Resource | Description |
+|:---------|:------------|
+| [Design Specification](docs/flux-design-spec.md) | Detailed architecture and design decisions |
+| [Project Structure](docs/flux-project-structure.md) | Implementation status and roadmap |
+| API Reference | Coming soon |
 
 ---
 
-## Documentation
+## Development
 
-- [Design Specification](docs/flux-design-spec.md) - Detailed design document
-- [Project Structure](docs/flux-project-structure.md) - Implementation status
-- [API Reference](docs/) - API documentation (coming soon)
+```bash
+# Install with dev dependencies
+pip install -e ".[dev]"
+
+# Run tests
+pytest                           # all tests
+pytest tests/unit/               # unit tests only
+pytest -m "not slow"             # skip slow tests
+
+# Code quality
+ruff check . && black --check . && mypy flux/
+```
 
 ---
 
 ## Contributing
 
-We welcome contributions! Please see our contributing guidelines.
+We welcome contributions! Please see our [contributing guidelines](CONTRIBUTING.md).
 
 ```bash
 # Setup development environment
 pip install -e ".[dev]"
 
-# Run tests
-pytest
-
-# Code quality checks
-ruff check . && black --check . && mypy flux/
+# Run all checks before commit
+ruff check . && black --check . && mypy flux/ && pytest
 ```
 
 ---
@@ -380,9 +297,9 @@ ruff check . && black --check . && mypy flux/
 
 ```bibtex
 @software{flux2025,
-  title = {Flux: An Adaptive Post-Training Framework for LLMs},
-  year = {2025},
-  url = {https://github.com/flux-team/flux}
+  title  = {Flux: An Adaptive Post-Training Framework for LLMs},
+  year   = {2025},
+  url    = {https://github.com/flux-team/flux}
 }
 ```
 
@@ -392,6 +309,6 @@ Apache 2.0
 
 ---
 
-<p align="center">
-  <b>Flux: Where stability meets efficiency</b>
-</p>
+<div align="center">
+<strong>Flux: Where stability meets efficiency</strong>
+</div>
