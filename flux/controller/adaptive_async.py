@@ -322,8 +322,9 @@ class AdaptiveAsyncController:
         """Record that a sync barrier was executed."""
         with self._lock:
             self._steps_since_sync = 0
-        if self.staleness_manager is not None:
-            self.staleness_manager.record_sync()
+            # Call staleness_manager inside lock to ensure thread safety
+            if self.staleness_manager is not None:
+                self.staleness_manager.record_sync()
 
     def reset(self) -> None:
         """Reset controller state."""
