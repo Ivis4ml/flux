@@ -1,0 +1,16 @@
+# Documentation dependencies
+mkdocs>=1.5.0
+mkdocs-material>=9.5.0
+mkdocs-material-extensions>=1.3
+pymdown-extensions>=10.0
+
+# Optional plugins (comment out if not needed)
+# mkdocs-minify-plugin>=0.7.0
+# mkdocs-git-revision-date-localized-plugin>=1.2.0
+
+# For API documentation (optional)
+# mkdocstrings>=0.24.0
+# mkdocstrings-python>=1.8.0
+
+# For versioning (optional)
+# mike>=2.0.0

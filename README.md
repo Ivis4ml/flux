@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/flux-concept.png" alt="Flux" width="480">
+<img src="docs/assets/flux-concept.png" alt="Flux" width="480">
 
 <h2>Adaptive Post-Training Framework for LLMs</h2>
 
@@ -472,7 +472,7 @@ algorithm: grpo  # or ppo, dpo, reinforce
 ## Architecture
 
 <p align="center">
-  <img src="docs/architecture.png" alt="Flux Architecture" width="600">
+  <img src="docs/assets/architecture.png" alt="Flux Architecture" width="600">
 </p>
 
 ### Deployment Topology

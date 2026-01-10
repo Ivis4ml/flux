@@ -1,0 +1,260 @@
+# Flux Documentation
+# MkDocs Material Configuration
+# Run with: mkdocs serve
+# Build with: mkdocs build
+
+site_name: Flux
+site_url: https://flux-rlhf.github.io/flux
+site_author: Flux Team
+site_description: >-
+  Adaptive Post-Training Framework for Large Language Models.
+  Combining synchronous stability with asynchronous efficiency.
+
+repo_name: flux-team/flux
+repo_url: https://github.com/flux-team/flux
+edit_uri: edit/main/docs/
+
+copyright: Copyright &copy; 2025 Flux Team
+
+theme:
+  name: material
+  # custom_dir: docs/overrides  # Uncomment for custom templates
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+
+  features:
+    - announce.dismiss
+    - content.action.edit
+    - content.action.view
+    - content.code.annotate
+    - content.code.copy
+    - content.code.select
+    - content.tabs.link
+    - content.tooltips
+    - header.autohide
+    - navigation.expand
+    - navigation.footer
+    - navigation.indexes
+    - navigation.instant
+    - navigation.instant.prefetch
+    - navigation.instant.progress
+    - navigation.path
+    - navigation.sections
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.top
+    - navigation.tracking
+    - search.highlight
+    - search.share
+    - search.suggest
+    - toc.follow
+
+  palette:
+    # Light mode
+    - scheme: default
+      primary: indigo
+      accent: deep purple
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    # Dark mode
+    - scheme: slate
+      primary: indigo
+      accent: deep purple
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+  font:
+    text: Inter
+    code: JetBrains Mono
+
+  icon:
+    repo: fontawesome/brands/github
+    admonition:
+      note: octicons/tag-16
+      abstract: octicons/checklist-16
+      info: octicons/info-16
+      tip: octicons/light-bulb-16
+      success: octicons/check-16
+      question: octicons/question-16
+      warning: octicons/alert-16
+      failure: octicons/x-circle-16
+      danger: octicons/zap-16
+      bug: octicons/bug-16
+      example: octicons/beaker-16
+      quote: octicons/quote-16
+
+plugins:
+  - search:
+      separator: '[\s\u200b\-_,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;|(?!\b)(?=[A-Z][a-z])'
+  # Optional plugins - uncomment after installing:
+  # - minify:
+  #     minify_html: true
+  # - git-revision-date-localized:
+  #     enable_creation_date: true
+  #     type: timeago
+
+extra:
+  # version:
+  #   provider: mike  # Enable after setting up mike for versioning
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/flux-team/flux
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/flux-rlhf/
+    - icon: fontawesome/brands/discord
+      link: https://discord.gg/flux-rlhf
+  analytics:
+    provider: google
+    property: G-XXXXXXXXXX
+  generator: false
+
+extra_css:
+  - stylesheets/extra.css
+  - https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css
+
+extra_javascript:
+  - javascripts/katex.js
+  - https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js
+  - https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js
+
+markdown_extensions:
+  # Python Markdown
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+
+  # Python Markdown Extensions
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.betterem:
+      smart_enable: all
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.magiclink:
+      normalize_issue_symbols: true
+      repo_url_shorthand: true
+      user: flux-team
+      repo: flux
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+      combine_header_slug: true
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+# Navigation structure
+nav:
+  - Home: index.md
+
+  - Getting Started:
+    - getting-started/index.md
+    - Installation: getting-started/installation.md
+    - Quick Start: getting-started/quickstart.md
+    - First Training Run: getting-started/first-training.md
+    - Configuration Basics: getting-started/configuration.md
+
+  - Tutorials:
+    - tutorials/index.md
+    - Basic RLHF Training: tutorials/basic-rlhf.md
+    - Custom Reward Functions: tutorials/custom-rewards.md
+    - Multi-GPU Training: tutorials/multi-gpu.md
+    - Fine-tuning with DPO: tutorials/dpo-training.md
+    - Adaptive Async in Practice: tutorials/adaptive-async.md
+    - Production Deployment: tutorials/production.md
+
+  - Core Concepts:
+    - concepts/index.md
+    - Architecture Overview: concepts/architecture.md
+    - Adaptive Async Control: concepts/adaptive-async.md
+    - Staleness & Importance: concepts/staleness.md
+    - APRIL Strategy: concepts/april.md
+    - Batch Composition: concepts/batch-composition.md
+    - Weight Synchronization: concepts/weight-sync.md
+
+  - Algorithms:
+    - algorithms/index.md
+    - PPO: algorithms/ppo.md
+    - GRPO: algorithms/grpo.md
+    - DPO: algorithms/dpo.md
+    - REINFORCE: algorithms/reinforce.md
+    - DAPO: algorithms/dapo.md
+    - RLOO: algorithms/rloo.md
+    - Custom Algorithms: algorithms/custom.md
+
+  - Configuration:
+    - configuration/index.md
+    - Full Reference: configuration/reference.md
+    - Training Config: configuration/training.md
+    - Adaptive Async Config: configuration/adaptive-async.md
+    - Rollout Config: configuration/rollout.md
+    - Algorithm Config: configuration/algorithm.md
+    - Example Configs: configuration/examples.md
+
+  - API Reference:
+    - api/index.md
+    - FluxConfig: api/config.md
+    - FluxTrainer: api/trainer.md
+    - FluxCoordinator: api/coordinator.md
+    - Trajectories: api/trajectory.md
+    - Rewards: api/rewards.md
+    - Algorithms: api/algorithms.md
+    - Utilities: api/utilities.md
+
+  - How-to Guides:
+    - how-to/index.md
+    - Add a Custom Algorithm: how-to/custom-algorithm.md
+    - Implement Custom Rewards: how-to/custom-rewards.md
+    - Scale to Multiple Nodes: how-to/multi-node.md
+    - Debug Training Issues: how-to/debugging.md
+    - Optimize Performance: how-to/performance.md
+    - Monitor with Prometheus: how-to/monitoring.md
+    - Resume from Checkpoint: how-to/checkpoints.md
+
+  - Design Docs:
+    - design/index.md
+    - Design Philosophy: design/philosophy.md
+    - Technical Specification: design/specification.md
+    - Comparison with Other Frameworks: design/comparison.md
+    - Roadmap: design/roadmap.md
+
+  - Contributing:
+    - contributing/index.md
+    - Development Setup: contributing/setup.md
+    - Code Style: contributing/code-style.md
+    - Testing: contributing/testing.md
+    - Documentation: contributing/documentation.md
+
+  - Changelog: changelog.md
+
+# Hooks for custom build steps (optional)
+# hooks:
+#   - docs/hooks/api_docs.py
