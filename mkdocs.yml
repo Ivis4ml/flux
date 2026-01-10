@@ -4,14 +4,14 @@
 # Build with: mkdocs build
 
 site_name: Flux
-site_url: https://flux-rlhf.github.io/flux
+site_url: https://ivis4ml.github.io/flux
 site_author: Flux Team
 site_description: >-
   Adaptive Post-Training Framework for Large Language Models.
   Combining synchronous stability with asynchronous efficiency.
 
-repo_name: flux-team/flux
-repo_url: https://github.com/flux-team/flux
+repo_name: Ivis4ml/flux
+repo_url: https://github.com/Ivis4ml/flux
 edit_uri: edit/main/docs/
 
 copyright: Copyright &copy; 2025 Flux Team

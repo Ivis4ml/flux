@@ -11,6 +11,7 @@
 <p>
 <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
 <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+"></a>
+<a href="https://ivis4ml.github.io/flux/"><img src="https://img.shields.io/badge/docs-GitHub%20Pages-blue.svg" alt="Documentation"></a>
 </p>
 
 <p>
@@ -18,7 +19,7 @@
 <a href="#quick-start">Quick Start</a> •
 <a href="#key-features">Features</a> •
 <a href="#architecture">Architecture</a> •
-<a href="docs/flux-design-spec.md">Design Doc</a>
+<a href="https://ivis4ml.github.io/flux/">Documentation</a>
 </p>
 
 </div>
@@ -568,11 +569,15 @@ Flux operates anywhere on the sync-async spectrum, adapting in real-time based o
 
 ## Documentation
 
+**Full documentation:** [https://ivis4ml.github.io/flux/](https://ivis4ml.github.io/flux/)
+
 | Resource | Description |
 |:---------|:------------|
-| [Design Specification](docs/flux-design-spec.md) | Detailed architecture and design decisions |
-| [Project Structure](docs/flux-project-structure.md) | Implementation status and roadmap |
-| API Reference | Coming soon |
+| [Getting Started](https://ivis4ml.github.io/flux/getting-started/) | Installation and quick start guide |
+| [Tutorials](https://ivis4ml.github.io/flux/tutorials/) | Step-by-step training tutorials |
+| [Algorithms](https://ivis4ml.github.io/flux/algorithms/) | PPO, GRPO, DPO, and custom algorithms |
+| [Configuration](https://ivis4ml.github.io/flux/configuration/) | Full configuration reference |
+| [API Reference](https://ivis4ml.github.io/flux/api/) | Complete API documentation |
 
 ---
 
