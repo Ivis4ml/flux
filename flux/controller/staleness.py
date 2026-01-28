@@ -251,11 +251,20 @@ class StalenessManager:
         if mask is None:
             mask = torch.ones_like(current_logprobs)
 
+        # Check for empty mask to avoid division by zero
+        mask_sum = mask.sum()
+        if mask_sum == 0:
+            # No valid tokens - return version-gap-only staleness
+            current_version = self.version_provider()
+            version_gaps = [current_version - v for v in trajectory_versions]
+            avg_version_gap = sum(version_gaps) / len(version_gaps) if version_gaps else 0.0
+            return self.compute_staleness(version_gap=avg_version_gap)
+
         # Compute KL divergence: E_q[log q - log p]
         # where q = behavior, p = current
         # KL(behavior || current) = E_behavior[log behavior - log current]
         log_ratio = behavior_logprobs - current_logprobs
-        kl = (log_ratio * mask).sum() / mask.sum()
+        kl = (log_ratio * mask).sum() / mask_sum
         # KL divergence is always non-negative; use abs to handle numerical issues
         kl_divergence = abs(kl.item())
 
@@ -264,8 +273,10 @@ class StalenessManager:
         log_importance = current_logprobs - behavior_logprobs
         # Sum log probs per sequence (assuming independent tokens)
         seq_log_importance = (log_importance * mask).sum(dim=-1)
+        # Clamp to avoid overflow in exp
+        seq_log_importance = seq_log_importance.clamp(-20, 20)
         importance_weights = torch.exp(seq_log_importance)
-        iw_variance = importance_weights.var().item()
+        iw_variance = importance_weights.var().item() if importance_weights.numel() > 1 else 0.0
 
         # Compute version gap
         current_version = self.version_provider()

@@ -24,6 +24,8 @@ from typing import Any, Callable
 from flux.core.config import RolloutConfig
 from flux.core.trajectory import PartialTrajectory, Trajectory, TrajectoryBuffer
 from flux.core.types import PolicyVersion, RolloutMetrics, TrajectoryStatus
+from flux.rollout.length_predictor import LengthPredictor
+from flux.rollout.partial_buffer import PartialTrajectoryBuffer
 from flux.rollout.sglang_client import (
     GenerationResult,
     GenerationStatus,
@@ -120,6 +122,8 @@ class StreamingRolloutManager:
         config: RolloutConfig | None = None,
         trajectory_buffer: TrajectoryBuffer | None = None,
         version_provider: Callable[[], PolicyVersion] | None = None,
+        length_predictor: LengthPredictor | None = None,
+        partial_buffer: PartialTrajectoryBuffer | None = None,
     ) -> None:
         """Initialize the rollout manager.
 
@@ -128,14 +132,28 @@ class StreamingRolloutManager:
             config: Rollout configuration.
             trajectory_buffer: Buffer for storing completed trajectories.
             version_provider: Function returning current policy version.
+            length_predictor: Predictor for output length scheduling.
+            partial_buffer: Buffer for storing partial trajectories.
         """
         self.client = client
         self.config = config or RolloutConfig()
         self.trajectory_buffer = trajectory_buffer
         self.version_provider = version_provider or (lambda: PolicyVersion(version_id=0))
 
-        # Partial trajectory storage
-        self._partial_buffer: deque[PartialTrajectory] = deque(maxlen=1000)
+        # Length predictor for smart scheduling (APRIL Learn)
+        self._length_predictor = length_predictor or LengthPredictor(
+            default_length=256,
+            min_length=16,
+            max_length=getattr(self.config, 'max_tokens', 4096),
+            history_size=1000,
+        )
+
+        # Partial trajectory buffer with priority-based retrieval (APRIL Reuse)
+        self._partial_buffer = partial_buffer or PartialTrajectoryBuffer(
+            max_size=1000,
+            max_staleness=getattr(self.config, 'max_partial_staleness', 5),
+            min_length_threshold=self.config.get_min_partial_tokens(),
+        )
 
         # Request tracking
         self._active_requests: dict[str, RolloutRequest] = {}
@@ -150,7 +168,17 @@ class StreamingRolloutManager:
     @property
     def num_partial(self) -> int:
         """Number of partial trajectories in buffer."""
-        return len(self._partial_buffer)
+        return self._partial_buffer.size
+
+    @property
+    def length_predictor(self) -> LengthPredictor:
+        """Access to the length predictor for external configuration."""
+        return self._length_predictor
+
+    @property
+    def partial_buffer(self) -> PartialTrajectoryBuffer:
+        """Access to the partial trajectory buffer."""
+        return self._partial_buffer
 
     def _generate_request_id(self) -> str:
         """Generate unique request ID."""
@@ -163,20 +191,24 @@ class StreamingRolloutManager:
         target_count: int | None = None,
         timeout: float | None = None,
         filter_fn: Callable[[Trajectory], bool] | None = None,
+        sort_by_length: bool = True,
     ) -> RolloutBatch:
         """Generate a batch of trajectories.
 
         Uses APRIL strategy:
         1. Oversample to get more candidates
-        2. Start generation
-        3. Abort long-tail after timeout
-        4. Filter and collect results
+        2. Sort by predicted length (short first) for faster batch completion
+        3. Start generation with partial trajectory reuse
+        4. Abort long-tail after timeout
+        5. Filter and collect results
+        6. Learn from observed lengths
 
         Args:
             prompts: List of prompts to generate from.
             target_count: Target number of successful trajectories.
             timeout: Maximum time to wait for batch completion.
             filter_fn: Optional filter function for trajectories.
+            sort_by_length: If True, sort prompts by predicted length (default True).
 
         Returns:
             RolloutBatch with results and metrics.
@@ -188,7 +220,19 @@ class StreamingRolloutManager:
         oversample_count = int(target_count * self.config.oversample_ratio)
         selected_prompts = prompts[:oversample_count]
 
-        # Try to reuse partial trajectories first
+        # Sort prompts by predicted length (APRIL Learn)
+        # Shorter outputs first -> faster batch completion, earlier abort for long-tail
+        if sort_by_length and len(selected_prompts) > 1:
+            sorted_pairs = self._length_predictor.sort_by_length(
+                selected_prompts, ascending=True
+            )
+            selected_prompts = [p for p, _ in sorted_pairs]
+
+        # Get current policy version for staleness checks
+        version = self.version_provider()
+        current_version_id = version.version_id
+
+        # Try to reuse partial trajectories first (APRIL Reuse)
         reused_count = 0
         requests = []
 
@@ -198,19 +242,23 @@ class StreamingRolloutManager:
                 prompt=prompt,
             )
 
-            # Check for partial trajectory match
-            partial = self._find_matching_partial(prompt)
+            # Check for partial trajectory match using priority-based buffer
+            partial = self._partial_buffer.find_match(
+                prompt,
+                current_version=current_version_id,
+                remove=True,  # Remove matched partial from buffer
+            )
             if partial is not None:
                 request.partial_trajectory = partial
                 request.continuation_prompt = partial.response
                 reused_count += 1
+                self._total_reused += 1
 
             requests.append(request)
             self._active_requests[request.request_id] = request
 
         # Start generation
         start_time = time.time()
-        version = self.version_provider()
 
         tasks = []
         for request in requests:
@@ -295,7 +343,10 @@ class StreamingRolloutManager:
         end_time: float,
         version: PolicyVersion,
     ) -> RolloutBatch:
-        """Process generation results into a batch."""
+        """Process generation results into a batch.
+
+        Also updates length predictor with observed lengths (APRIL Learn).
+        """
         trajectories = []
         partial_trajectories = []
         failed_requests = []
@@ -318,16 +369,23 @@ class StreamingRolloutManager:
 
             if result.status == GenerationStatus.ABORTED:
                 aborted += 1
-                # Save as partial if long enough (using ratio-based threshold)
+                # Save as partial if long enough (APRIL Partial)
                 min_tokens = self.config.get_min_partial_tokens()
                 if len(result.tokens) >= min_tokens:
                     partial = self._create_partial_trajectory(request, result, version)
                     partial_trajectories.append(partial)
-                    self._partial_buffer.append(partial)
+                    # Use priority-based buffer instead of simple deque
+                    self._partial_buffer.add(partial)
                 continue
 
             # Create trajectory
             trajectory = self._create_trajectory(request, result, version)
+
+            # Update length predictor with observed output length (APRIL Learn)
+            self._length_predictor.observe(
+                prompt=request.prompt,
+                actual_length=result.completion_tokens,
+            )
 
             # Apply filter
             if filter_fn and not filter_fn(trajectory):
@@ -429,30 +487,23 @@ class StreamingRolloutManager:
             },
         )
 
-    def _find_matching_partial(self, prompt: str) -> PartialTrajectory | None:
-        """Find a partial trajectory matching the prompt."""
-        for i, partial in enumerate(self._partial_buffer):
-            if partial.prompt == prompt:
-                # Remove from buffer and return
-                del self._partial_buffer[i]
-                self._total_reused += 1
-                return partial
-        return None
-
     async def generate_stream(
         self,
         prompts: list[str],
         target_count: int | None = None,
         min_yield_size: int | None = None,
+        sort_by_length: bool = True,
     ):
         """Generate trajectories with streaming results.
 
         Yields batches as they complete rather than waiting for all.
+        Uses APRIL strategy with length prediction and partial reuse.
 
         Args:
             prompts: List of prompts.
             target_count: Target number of trajectories.
             min_yield_size: Minimum batch size before yielding.
+            sort_by_length: If True, sort prompts by predicted length.
 
         Yields:
             Lists of Trajectories as they complete.
@@ -464,18 +515,41 @@ class StreamingRolloutManager:
         oversample_count = int(target_count * self.config.oversample_ratio)
         selected_prompts = prompts[:oversample_count]
 
+        # Sort prompts by predicted length (APRIL Learn)
+        if sort_by_length and len(selected_prompts) > 1:
+            sorted_pairs = self._length_predictor.sort_by_length(
+                selected_prompts, ascending=True
+            )
+            selected_prompts = [p for p, _ in sorted_pairs]
+
         version = self.version_provider()
+        current_version_id = version.version_id
         pending_results = []
         yielded_count = 0
 
-        # Create tasks for all prompts
+        # Create tasks for all prompts with partial reuse
         tasks = []
+        request_map: dict[str, RolloutRequest] = {}  # Track requests for length observation
+
         for prompt in selected_prompts:
             request = RolloutRequest(
                 request_id=self._generate_request_id(),
                 prompt=prompt,
             )
+
+            # Check for partial trajectory match (APRIL Reuse)
+            partial = self._partial_buffer.find_match(
+                prompt,
+                current_version=current_version_id,
+                remove=True,
+            )
+            if partial is not None:
+                request.partial_trajectory = partial
+                request.continuation_prompt = partial.response
+                self._total_reused += 1
+
             self._active_requests[request.request_id] = request
+            request_map[request.request_id] = request
             task = asyncio.create_task(self._generate_single(request, version))
             tasks.append(task)
 
@@ -490,6 +564,19 @@ class StreamingRolloutManager:
                 ):
                     trajectory = self._create_trajectory(request, result, version)
                     pending_results.append(trajectory)
+
+                    # Update length predictor (APRIL Learn)
+                    self._length_predictor.observe(
+                        prompt=request.prompt,
+                        actual_length=result.completion_tokens,
+                    )
+
+                elif result is not None and result.status == GenerationStatus.ABORTED:
+                    # Save aborted as partial (APRIL Partial)
+                    min_tokens = self.config.get_min_partial_tokens()
+                    if len(result.tokens) >= min_tokens:
+                        partial = self._create_partial_trajectory(request, result, version)
+                        self._partial_buffer.add(partial)
 
                 # Yield when we have enough
                 if len(pending_results) >= min_yield_size:
@@ -540,6 +627,31 @@ class StreamingRolloutManager:
         Returns:
             Number of cleared trajectories.
         """
-        count = len(self._partial_buffer)
-        self._partial_buffer.clear()
-        return count
+        return self._partial_buffer.clear()
+
+    def cleanup_stale_partials(self) -> int:
+        """Remove stale partial trajectories.
+
+        Removes partials that are too old relative to current policy version.
+
+        Returns:
+            Number of removed trajectories.
+        """
+        current_version = self.version_provider().version_id
+        return self._partial_buffer.cleanup_stale(current_version)
+
+    def get_partial_buffer_stats(self) -> dict[str, Any]:
+        """Get statistics about the partial trajectory buffer.
+
+        Returns:
+            Dict with buffer statistics including size, match rate, etc.
+        """
+        return self._partial_buffer.get_statistics()
+
+    def get_length_predictor_stats(self) -> dict[str, float]:
+        """Get statistics about the length predictor.
+
+        Returns:
+            Dict with predictor statistics including mean length, etc.
+        """
+        return self._length_predictor.get_statistics()

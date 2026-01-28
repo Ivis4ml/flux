@@ -16,17 +16,19 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterator
 
+import torch
+
 from flux.controller.adaptive_async import AdaptiveAsyncScheduler
+from flux.controller.mode_gate import AsyncMode, ModeGate, ModeGateConfig
+from flux.coordinator.communication import CommunicationManager
 from flux.core.config import FluxConfig
 from flux.core.metrics import MetricsAggregator
 from flux.core.trajectory import Trajectory, TrajectoryBatch, TrajectoryBuffer
 from flux.core.types import (
     AsyncDecision,
-    BatchMetrics,
     PolicyVersion,
     RolloutMetrics,
     StalenessMetrics,
@@ -37,6 +39,7 @@ from flux.rewards.base import RewardFunction
 from flux.rollout.manager import StreamingRolloutManager
 from flux.rollout.sglang_client import SGLangClient
 from flux.sync.weight_sync import WeightSyncManager
+from flux.training.base import TrainingBackend, TrainingBackendBase, create_training_backend
 from flux.training.batch_composer import SmartBatchComposer
 from flux.training.megatron_engine import MegatronEngine, TrainingStep
 
@@ -99,7 +102,7 @@ class FluxCoordinator:
     def __init__(
         self,
         config: FluxConfig,
-        training_engine: MegatronEngine | None = None,
+        training_engine: MegatronEngine | TrainingBackendBase | None = None,
         sglang_client: SGLangClient | None = None,
         reward_function: RewardFunction | None = None,
     ) -> None:
@@ -107,14 +110,14 @@ class FluxCoordinator:
 
         Args:
             config: FluxConfig with all settings.
-            training_engine: Optional pre-configured training engine.
+            training_engine: Optional pre-configured training engine (MegatronEngine or TrainingBackend).
             sglang_client: Optional pre-configured SGLang client.
             reward_function: Optional custom reward function.
         """
         self.config = config
 
         # Core components (initialized later or passed in)
-        self._engine = training_engine
+        self._engine: MegatronEngine | TrainingBackendBase | None = training_engine
         self._sglang = sglang_client
         self._reward_fn = reward_function
         self._rollout_manager: StreamingRolloutManager | None = None
@@ -142,6 +145,22 @@ class FluxCoordinator:
         )
         self._staleness_manager = self._async_scheduler.staleness_manager
 
+        # Mode gate for sync/async transitions
+        self._mode_gate = ModeGate(
+            config=ModeGateConfig(
+                staleness_threshold=config.adaptive_async.staleness_threshold
+                if hasattr(config.adaptive_async, 'staleness_threshold')
+                else 0.3,
+                capacity_low_watermark=config.adaptive_async.capacity_low_watermark
+                if hasattr(config.adaptive_async, 'capacity_low_watermark')
+                else 0,
+                buffer_high_watermark=config.adaptive_async.buffer_high_watermark
+                if hasattr(config.adaptive_async, 'buffer_high_watermark')
+                else 0.9,
+            ),
+            staleness_manager=self._staleness_manager,
+        )
+
         # Weight sync
         self._weight_sync = WeightSyncManager()
 
@@ -150,6 +169,9 @@ class FluxCoordinator:
 
         # Callbacks
         self._step_callbacks: list[Callable[[StepResult], None]] = []
+
+        # Communication layer (ZeroMQ/gRPC)
+        self._comm_manager: CommunicationManager | None = None
 
         # Initialization flag
         self._initialized = False
@@ -273,14 +295,30 @@ class FluxCoordinator:
 
         logger.info("Initializing FluxCoordinator...")
 
-        # Initialize training engine
+        # Initialize training engine based on config.training_backend
         if self._engine is None:
-            self._engine = MegatronEngine(
-                config=self.config.megatron,
-                algorithm_config=self.config.algorithm,
-            )
-        self._engine.initialize()
-        self._engine.load_model(self.config.model_path)
+            from flux.core.config import TrainingBackendType
+            backend_type = self.config.training_backend
+
+            if backend_type == TrainingBackendType.MEGATRON:
+                # Use MegatronEngine directly (legacy path)
+                self._engine = MegatronEngine(
+                    config=self.config.megatron,
+                    algorithm_config=self.config.algorithm,
+                )
+                self._engine.initialize()
+                self._engine.load_model(self.config.model_path)
+            else:
+                # Use TrainingBackend ABC via factory
+                self._engine = create_training_backend(self.config)
+                self._engine.initialize(self.config)
+        elif isinstance(self._engine, MegatronEngine):
+            self._engine.initialize()
+            self._engine.load_model(self.config.model_path)
+        else:
+            # TrainingBackendBase instance passed in
+            if not self._engine.is_initialized:
+                self._engine.initialize(self.config)
 
         # Initialize SGLang client
         if self._sglang is None:
@@ -313,6 +351,21 @@ class FluxCoordinator:
         for url in sglang_urls:
             self._weight_sync.add_server(url)
 
+        # Initialize ZeroMQ/gRPC communication layer (optional, for distributed workers)
+        comm_config = self.config.communication
+        try:
+            self._comm_manager = CommunicationManager(
+                use_zmq=comm_config.use_zmq,
+                zmq_router_addr=comm_config.zmq_router_addr,
+                zmq_pub_addr=comm_config.zmq_pub_addr,
+                identity=comm_config.identity,
+            )
+            await self._comm_manager.start()
+            logger.info("Communication manager initialized (ZMQ: %s)", self._comm_manager.use_zmq)
+        except Exception as e:
+            logger.warning(f"Failed to initialize communication manager: {e}")
+            self._comm_manager = None
+
         self._initialized = True
         logger.info("FluxCoordinator initialized")
 
@@ -323,6 +376,14 @@ class FluxCoordinator:
     async def _shutdown_impl(self) -> None:
         """Shutdown components on the dedicated async loop."""
         logger.info("Shutting down FluxCoordinator...")
+
+        # Stop communication manager
+        if self._comm_manager is not None:
+            try:
+                await self._comm_manager.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping communication manager: {e}")
+            self._comm_manager = None
 
         # Disconnect SGLang
         if self._sglang is not None and hasattr(self._sglang, 'close'):
@@ -358,8 +419,11 @@ class FluxCoordinator:
         prompt_iter = iter(prompts) if not hasattr(prompts, '__iter__') else iter(prompts)
 
         while self._state.step < num_steps:
-            # Get prompts for this step
-            batch_prompts = self._get_next_prompts(prompt_iter)
+            # Get current async_ratio for scheduling
+            current_async_ratio = self._async_scheduler.async_ratio
+
+            # Get prompts for this step (scaled by async_ratio)
+            batch_prompts = self._get_next_prompts(prompt_iter, async_ratio=current_async_ratio)
             if not batch_prompts:
                 logger.warning("No more prompts available")
                 break
@@ -397,7 +461,11 @@ class FluxCoordinator:
         prompt_iter = iter(prompts)
 
         while self._state.step < num_steps:
-            batch_prompts = self._get_next_prompts(prompt_iter)
+            # Get current async_ratio for scheduling
+            current_async_ratio = self._async_scheduler.async_ratio
+
+            # Get prompts for this step (scaled by async_ratio)
+            batch_prompts = self._get_next_prompts(prompt_iter, async_ratio=current_async_ratio)
             if not batch_prompts:
                 break
 
@@ -436,6 +504,15 @@ class FluxCoordinator:
         staleness_metrics = self._compute_staleness_metrics(trajectories)
         async_decision = self._async_scheduler.step(staleness_metrics=staleness_metrics)
 
+        # 4b. Evaluate ModeGate state based on current metrics
+        buffer_fill_ratio = len(self._buffer) / self._buffer.max_size if self._buffer.max_size > 0 else 0.0
+        mode_state = self._mode_gate.evaluate(
+            staleness=staleness_metrics.combined_staleness,
+            capacity=self._async_scheduler.get_capacity() or 0,
+            buffer_fill_ratio=buffer_fill_ratio,
+            in_flight=self._staleness_manager.stats.total_in_flight,
+        )
+
         # 5. Compose batch
         batch = self._compose_batch()
         if batch is None or len(batch) == 0:
@@ -448,9 +525,13 @@ class FluxCoordinator:
         # 6. Run training step
         training_result = self._train_step(batch)
 
-        # 7. Maybe sync weights
+        # Track batch consumption for capacity throttling
+        if training_result is not None:
+            self._async_scheduler.on_batch_consumed(len(batch))
+
+        # 7. Maybe sync weights (check both async_decision and ModeGate)
         sync_performed = False
-        if async_decision.should_sync:
+        if async_decision.should_sync or mode_state.mode == AsyncMode.SYNC_BARRIER:
             self._sync_weights()
             sync_performed = True
 
@@ -501,6 +582,15 @@ class FluxCoordinator:
         staleness_metrics = self._compute_staleness_metrics(trajectories)
         async_decision = self._async_scheduler.step(staleness_metrics=staleness_metrics)
 
+        # 4b. Evaluate ModeGate state based on current metrics
+        buffer_fill_ratio = len(self._buffer) / self._buffer.max_size if self._buffer.max_size > 0 else 0.0
+        mode_state = self._mode_gate.evaluate(
+            staleness=staleness_metrics.combined_staleness,
+            capacity=self._async_scheduler.get_capacity() or 0,
+            buffer_fill_ratio=buffer_fill_ratio,
+            in_flight=self._staleness_manager.stats.total_in_flight,
+        )
+
         # 5. Compose batch
         batch = self._compose_batch()
         if batch is None or len(batch) == 0:
@@ -513,9 +603,13 @@ class FluxCoordinator:
         # 6. Run training step
         training_result = self._train_step(batch)
 
-        # 7. Maybe sync weights
+        # Track batch consumption for capacity throttling
+        if training_result is not None:
+            self._async_scheduler.on_batch_consumed(len(batch))
+
+        # 7. Maybe sync weights (check both async_decision and ModeGate)
         sync_performed = False
-        if async_decision.should_sync:
+        if async_decision.should_sync or mode_state.mode == AsyncMode.SYNC_BARRIER:
             await self._sync_weights_async()
             sync_performed = True
 
@@ -541,26 +635,67 @@ class FluxCoordinator:
             sync_performed=sync_performed,
         )
 
-    def _get_next_prompts(self, prompt_iter: Iterator[str]) -> list[str]:
-        """Get the next batch of prompts.
+    def _get_next_prompts(
+        self,
+        prompt_iter: Iterator[str],
+        async_ratio: float | None = None,
+    ) -> list[str]:
+        """Get the next batch of prompts, scaled by async_ratio and capacity.
+
+        Uses adaptive async scheduling and ModeGate to control rollout submission:
+        - Higher async_ratio = more aggressive oversampling
+        - Respects capacity limits to prevent excessive staleness
+        - Respects ModeGate state (no rollouts in SYNC_BARRIER or THROTTLED modes)
 
         Args:
             prompt_iter: Iterator over prompts.
+            async_ratio: Current async ratio from adaptive scheduler (0-1).
 
         Returns:
             List of prompts for next batch.
         """
         batch_size = self.config.batch_size
-        oversample = self.config.rollout.oversample_ratio
+        base_oversample = self.config.rollout.oversample_ratio
 
-        target = int(batch_size * oversample)
+        # Check ModeGate - don't submit if in SYNC_BARRIER or THROTTLED
+        if not self._mode_gate.can_submit_rollout():
+            # Still need to make progress, submit minimum batch
+            logger.debug(
+                f"ModeGate blocking rollouts (mode={self._mode_gate.current_mode.name}), "
+                f"submitting minimum batch"
+            )
+            target = batch_size
+        else:
+            # Scale oversampling by async_ratio
+            # High async_ratio (close to 1) = more aggressive oversampling
+            # Low async_ratio (close to 0) = conservative, closer to batch_size
+            if async_ratio is not None:
+                # Interpolate between 1.0 (no oversample) and full oversample
+                scaled_oversample = 1.0 + (base_oversample - 1.0) * async_ratio
+            else:
+                scaled_oversample = base_oversample
+
+            target = int(batch_size * scaled_oversample)
+
+        # Check capacity - don't submit if buffer is too full/stale
+        capacity = self._async_scheduler.get_capacity()
+        if capacity is not None and capacity > 0:
+            # Limit to available capacity
+            target = min(target, capacity)
+        elif capacity == 0:
+            # No capacity - still submit minimum batch for progress
+            target = min(target, batch_size)
+
         prompts = []
-
         for _ in range(target):
             try:
                 prompts.append(next(prompt_iter))
             except StopIteration:
                 break
+
+        # Track enqueued prompts for capacity throttling
+        if prompts:
+            self._async_scheduler.on_rollout_enqueued(len(prompts))
 
         return prompts
 
@@ -576,10 +711,24 @@ class FluxCoordinator:
         Returns:
             List of generated trajectories.
         """
-        if not self._use_real_rollouts or self._rollout_manager is None:
-            return self._generate_rollouts_stub(prompts)
+        # Mark as submitted (moved from enqueued to running)
+        if prompts:
+            self._async_scheduler.on_rollout_submitted(len(prompts))
 
-        return self._run_async(self._generate_rollouts_async_impl(prompts))
+        if not self._use_real_rollouts or self._rollout_manager is None:
+            trajectories = self._generate_rollouts_stub(prompts)
+        else:
+            trajectories = self._run_async(self._generate_rollouts_async_impl(prompts))
+
+        # Track completed/failed rollouts
+        completed = len(trajectories)
+        failed = len(prompts) - completed
+        if completed > 0:
+            self._async_scheduler.on_rollout_completed(completed)
+        if failed > 0:
+            self._async_scheduler.on_rollout_failed(failed)
+
+        return trajectories
 
     def _generate_rollouts_stub(self, prompts: list[str]) -> list[Trajectory]:
         """Generate stub trajectories for testing.
@@ -603,7 +752,21 @@ class FluxCoordinator:
 
     async def _generate_rollouts_async(self, prompts: list[str]) -> list[Trajectory]:
         """Generate rollouts asynchronously using the dedicated async loop."""
-        return await self._await_async(self._generate_rollouts_async_impl(prompts))
+        # Mark as submitted (moved from enqueued to running)
+        if prompts:
+            self._async_scheduler.on_rollout_submitted(len(prompts))
+
+        trajectories = await self._await_async(self._generate_rollouts_async_impl(prompts))
+
+        # Track completed/failed rollouts
+        completed = len(trajectories)
+        failed = len(prompts) - completed
+        if completed > 0:
+            self._async_scheduler.on_rollout_completed(completed)
+        if failed > 0:
+            self._async_scheduler.on_rollout_failed(failed)
+
+        return trajectories
 
     async def _generate_rollouts_async_impl(self, prompts: list[str]) -> list[Trajectory]:
         """Generate rollouts asynchronously using StreamingRolloutManager.
@@ -689,10 +852,104 @@ class FluxCoordinator:
     def _compute_staleness_metrics(
         self, trajectories: list[Trajectory]
     ) -> StalenessMetrics:
-        """Compute staleness metrics from trajectory versions."""
+        """Compute staleness metrics from trajectory versions and log probs.
+
+        Uses full staleness computation including:
+        - KL divergence between current and behavior policies
+        - Importance weight variance
+        - Version gap
+
+        Falls back to version-gap-only computation if:
+        - Log probs unavailable
+        - log_probs == behavior_log_probs (would give meaningless 0 KL/IW)
+        """
         if not trajectories:
             return self._staleness_manager.compute_staleness(version_gap=0.0)
 
+        # Try to compute full staleness with KL and IW variance
+        # This requires both behavior and current log probs, and they must differ
+        has_behavior_logprobs = all(
+            traj.behavior_log_probs is not None and len(traj.behavior_log_probs) > 0
+            for traj in trajectories
+        )
+        has_current_logprobs = all(
+            traj.log_probs is not None and len(traj.log_probs) > 0
+            for traj in trajectories
+        )
+
+        # Check if log_probs differ from behavior_log_probs
+        # If they're the same, KL and IW variance would be 0 (meaningless)
+        has_distinct_logprobs = False
+        if has_behavior_logprobs and has_current_logprobs:
+            for traj in trajectories:
+                if traj.log_probs != traj.behavior_log_probs:
+                    has_distinct_logprobs = True
+                    break
+
+        if has_behavior_logprobs and has_current_logprobs and has_distinct_logprobs:
+            try:
+                # Collect log probs and versions
+                current_logprobs_list = []
+                behavior_logprobs_list = []
+                versions = []
+                masks = []
+
+                for traj in trajectories:
+                    if traj.log_probs is not None and traj.behavior_log_probs is not None:
+                        # Convert to tensors if needed
+                        current_lp = traj.log_probs
+                        behavior_lp = traj.behavior_log_probs
+
+                        if isinstance(current_lp, list):
+                            current_lp = torch.tensor(current_lp)
+                        if isinstance(behavior_lp, list):
+                            behavior_lp = torch.tensor(behavior_lp)
+
+                        current_logprobs_list.append(current_lp)
+                        behavior_logprobs_list.append(behavior_lp)
+                        versions.append(traj.version.version_id)
+
+                        # Use loss_mask if available, else ones
+                        if hasattr(traj, 'loss_mask') and traj.loss_mask is not None:
+                            mask = traj.loss_mask
+                            if isinstance(mask, list):
+                                mask = torch.tensor(mask, dtype=torch.float)
+                            masks.append(mask)
+                        else:
+                            masks.append(torch.ones_like(current_lp))
+
+                if current_logprobs_list:
+                    # Pad sequences to same length for batch processing
+                    max_len = max(lp.shape[-1] for lp in current_logprobs_list)
+
+                    def pad_to_length(tensor: torch.Tensor, length: int) -> torch.Tensor:
+                        if tensor.shape[-1] >= length:
+                            return tensor[..., :length]
+                        pad_size = length - tensor.shape[-1]
+                        return torch.nn.functional.pad(tensor, (0, pad_size), value=0.0)
+
+                    current_batch = torch.stack([
+                        pad_to_length(lp, max_len) for lp in current_logprobs_list
+                    ])
+                    behavior_batch = torch.stack([
+                        pad_to_length(lp, max_len) for lp in behavior_logprobs_list
+                    ])
+                    mask_batch = torch.stack([
+                        pad_to_length(m, max_len) for m in masks
+                    ])
+
+                    # Compute full staleness with KL and IW variance
+                    return self._staleness_manager.compute_staleness_from_trajectories(
+                        current_logprobs=current_batch,
+                        behavior_logprobs=behavior_batch,
+                        trajectory_versions=versions,
+                        mask=mask_batch,
+                    )
+
+            except Exception as e:
+                logger.warning(f"Failed to compute full staleness, falling back to version gap: {e}")
+
+        # Fallback: version-gap only computation
         gaps = [
             traj.get_version_gap(self._state.version) for traj in trajectories
         ]
@@ -792,13 +1049,14 @@ class FluxCoordinator:
             if hasattr(method, 'value'):
                 method = method.value
 
-            # Push serialized bytes to SGLang server(s)
+            # Push serialized bytes to SGLang server(s) via HTTP
+            http_success = False
             if hasattr(self._sglang, 'update_weights'):
-                success = await self._sglang.update_weights(
+                http_success = await self._sglang.update_weights(
                     weights=payload_bytes,
                     version=version,
                 )
-                if success:
+                if http_success:
                     self._weight_sync.mark_updated()
                     if method == "delta":
                         self._weight_sync.set_baseline(state_dict, version)
@@ -811,7 +1069,20 @@ class FluxCoordinator:
             else:
                 # Fallback for testing without full SGLang
                 self._weight_sync.mark_updated()
+                http_success = True
                 logger.debug(f"Weight sync marked (SGLang update_weights not available) at version {version}")
+
+            # Also broadcast via ZeroMQ if communication manager is available
+            # This enables distributed workers to receive weight updates
+            if self._comm_manager is not None and http_success:
+                try:
+                    await self._comm_manager.broadcast_weights(
+                        weights=state_dict,
+                        version=version,
+                    )
+                    logger.debug(f"Weight update broadcast via ZMQ at version {version}")
+                except Exception as zmq_err:
+                    logger.warning(f"ZMQ weight broadcast failed: {zmq_err}")
 
         except Exception as e:
             logger.error(f"Weight sync failed: {e}")
@@ -916,5 +1187,6 @@ class FluxCoordinator:
             "current_version": self._weight_sync.current_version,
             "is_dirty": self._weight_sync.is_dirty,
         }
+        stats["mode_gate"] = self._mode_gate.get_diagnostics()
 
         return stats

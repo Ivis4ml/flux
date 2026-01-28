@@ -1,10 +1,11 @@
 """Flux training module.
 
 This module provides the training infrastructure for Flux, including:
+- Native trainer contract (TrainingBackend ABC, GPUBatch)
 - Algorithm registry for extensible RL algorithms
 - Built-in algorithms (PPO, GRPO, REINFORCE, DPO, DAPO, GSPO, RLOO)
 - Batch composition utilities
-- Training engines (Megatron)
+- Training backends (Transformers, Megatron)
 """
 
 from flux.training.algorithms import (
@@ -15,6 +16,14 @@ from flux.training.algorithms import (
     register_policy_loss,
     get_adv_estimator_fn,
     get_policy_loss_fn,
+)
+from flux.training.base import (
+    GPUBatch,
+    TrainStepResult,
+    TrainingBackend,
+    TrainingBackendBase,
+    TrainingBackendType,
+    create_training_backend,
 )
 from flux.training.batch_composer import (
     BatchIterator,
@@ -29,8 +38,16 @@ from flux.training.megatron_engine import (
     TrainingEngine,
     TrainingStep,
 )
+from flux.training.backends import TransformersBackend
 
 __all__ = [
+    # Native trainer contract
+    "GPUBatch",
+    "TrainStepResult",
+    "TrainingBackend",
+    "TrainingBackendBase",
+    "TrainingBackendType",
+    "create_training_backend",
     # Algorithms
     "ADV_ESTIMATOR_REGISTRY",
     "POLICY_LOSS_REGISTRY",
@@ -45,7 +62,9 @@ __all__ = [
     "LengthBucket",
     "SmartBatchComposer",
     "StalenessStratum",
-    # Training engines
+    # Training backends
+    "TransformersBackend",
+    # Legacy training engines
     "MegatronEngine",
     "ModelState",
     "TrainingEngine",

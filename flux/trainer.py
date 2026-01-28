@@ -20,6 +20,7 @@ from flux.core.trajectory import Trajectory, TrajectoryBuffer
 from flux.core.types import BatchMetrics, TrainingState
 from flux.rewards.base import RewardFunction
 from flux.rollout.sglang_client import SGLangClient
+from flux.training.base import TrainingBackendBase
 from flux.training.megatron_engine import MegatronEngine
 
 
@@ -105,7 +106,7 @@ class FluxTrainer:
     def __init__(
         self,
         config: FluxConfig,
-        training_engine: MegatronEngine | None = None,
+        training_engine: MegatronEngine | TrainingBackendBase | None = None,
         sglang_client: SGLangClient | None = None,
         reward_function: RewardFunction | None = None,
     ) -> None:
@@ -113,7 +114,7 @@ class FluxTrainer:
 
         Args:
             config: FluxConfig with all training settings.
-            training_engine: Optional pre-configured training engine.
+            training_engine: Optional pre-configured training engine (MegatronEngine or TrainingBackend).
             sglang_client: Optional pre-configured SGLang client.
             reward_function: Optional custom reward function.
         """

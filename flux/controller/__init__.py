@@ -4,6 +4,7 @@ This module provides control plane components for Flux:
 - Importance correction for off-policy data
 - Staleness management and tracking
 - Adaptive async control with PID
+- Mode Gate for sync/async state machine
 """
 
 from flux.controller.importance import (
@@ -23,6 +24,13 @@ from flux.controller.adaptive_async import (
     ControllerRecord,
     PIDState,
 )
+from flux.controller.mode_gate import (
+    AsyncMode,
+    ModeGate,
+    ModeGateConfig,
+    ModeGateIntegration,
+    ModeGateState,
+)
 
 __all__ = [
     # Importance correction
@@ -39,4 +47,10 @@ __all__ = [
     "AdaptiveAsyncScheduler",
     "ControllerRecord",
     "PIDState",
+    # Mode Gate
+    "AsyncMode",
+    "ModeGate",
+    "ModeGateConfig",
+    "ModeGateIntegration",
+    "ModeGateState",
 ]

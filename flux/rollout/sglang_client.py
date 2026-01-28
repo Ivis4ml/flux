@@ -459,6 +459,8 @@ class SGLangClient:
     ) -> AsyncIterator[GenerationResult]:
         """Stream generation results token by token.
 
+        Uses Server-Sent Events (SSE) for real-time token streaming.
+
         Args:
             prompt: The prompt.
             **kwargs: Generation parameters.
@@ -472,10 +474,150 @@ class SGLangClient:
             yield result
             return
 
-        # For now, fall back to non-streaming
-        # Full streaming implementation requires SSE support
-        result = await self.generate(prompt, **kwargs)
-        yield result
+        import json
+
+        url = self._get_next_server_url()
+        endpoint = f"{url}/generate"
+        request_id = kwargs.pop("request_id", f"stream-{time.time()}")
+
+        # Use rollout_config for generation params (SGLangConfig doesn't have these)
+        request_data: dict[str, Any] = {
+            "sampling_params": {
+                "max_new_tokens": kwargs.get("max_tokens", self.rollout_config.max_tokens),
+                "temperature": kwargs.get("temperature", self.rollout_config.temperature),
+                "top_p": kwargs.get("top_p", self.rollout_config.top_p),
+            },
+            "stream": True,
+            "rid": request_id,
+            "return_logprob": kwargs.get("return_logprobs", True),
+        }
+
+        # Add prompt (text or token IDs)
+        if isinstance(prompt, str):
+            request_data["text"] = prompt
+        else:
+            request_data["input_ids"] = prompt
+
+        # Track for abort capability
+        self._pending_requests[request_id] = request_data
+        start_time = time.time()
+
+        try:
+            async with self._client.stream(
+                "POST",
+                endpoint,
+                json=request_data,
+                timeout=self.config.timeout,
+            ) as response:
+                response.raise_for_status()
+
+                # Accumulated state for streaming
+                accumulated_text = ""
+                accumulated_tokens: list[int] = []
+                accumulated_log_probs: list[float] = []
+                finish_reason = None
+
+                # Parse SSE events
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+
+                    # SSE format: "data: {...}"
+                    if line.startswith("data:"):
+                        data_str = line[5:].strip()
+
+                        # Check for end of stream
+                        if data_str == "[DONE]":
+                            break
+
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        # Extract token info from SSE event
+                        # SGLang typically sends: {"text": "token", "meta_info": {...}}
+                        if "text" in data:
+                            new_text = data["text"]
+                            accumulated_text += new_text
+
+                        if "meta_info" in data:
+                            meta = data["meta_info"]
+                            if "output_token_ids" in meta:
+                                accumulated_tokens = meta["output_token_ids"]
+                            if "output_token_logprobs" in meta:
+                                accumulated_log_probs = meta["output_token_logprobs"]
+                            if "finish_reason" in meta:
+                                finish_reason = meta["finish_reason"]
+
+                        # Yield partial result
+                        current_time = time.time()
+
+                        partial_result = GenerationResult(
+                            request_id=request_id,
+                            status=GenerationStatus.GENERATING,
+                            prompt=prompt,
+                            response=accumulated_text,
+                            tokens=accumulated_tokens,
+                            log_probs=accumulated_log_probs if accumulated_log_probs else [],
+                            finish_reason=finish_reason if finish_reason else "",
+                            start_time=start_time,
+                            end_time=current_time,
+                            prompt_tokens=len(prompt.split()) if isinstance(prompt, str) else len(prompt),
+                            completion_tokens=len(accumulated_tokens),
+                            weight_version=self._weight_version,
+                        )
+                        yield partial_result
+
+                # Final result
+                end_time = time.time()
+                status = GenerationStatus.COMPLETED
+                if finish_reason == "length":
+                    status = GenerationStatus.TRUNCATED
+
+                final_result = GenerationResult(
+                    request_id=request_id,
+                    status=status,
+                    prompt=prompt,
+                    response=accumulated_text,
+                    tokens=accumulated_tokens,
+                    log_probs=accumulated_log_probs if accumulated_log_probs else [],
+                    finish_reason=finish_reason if finish_reason else "",
+                    start_time=start_time,
+                    end_time=end_time,
+                    prompt_tokens=len(prompt.split()) if isinstance(prompt, str) else len(prompt),
+                    completion_tokens=len(accumulated_tokens),
+                    weight_version=self._weight_version,
+                )
+                self._successful_requests += 1
+                yield final_result
+
+        except httpx.TimeoutException:
+            logger.warning(f"Streaming request {request_id} timed out")
+            yield GenerationResult(
+                request_id=request_id,
+                status=GenerationStatus.FAILED,
+                prompt=prompt,
+                response="",
+                tokens=[],
+                error="Timeout",
+                start_time=start_time,
+                end_time=time.time(),
+            )
+        except Exception as e:
+            logger.error(f"Streaming error: {e}")
+            yield GenerationResult(
+                request_id=request_id,
+                status=GenerationStatus.FAILED,
+                prompt=prompt,
+                response="",
+                tokens=[],
+                error=str(e),
+                start_time=start_time,
+                end_time=time.time(),
+            )
+        finally:
+            self._pending_requests.pop(request_id, None)
 
     async def abort_request(self, request_id: str) -> bool:
         """Abort a pending generation request.

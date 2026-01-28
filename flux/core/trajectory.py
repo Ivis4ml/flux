@@ -9,11 +9,14 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 import torch
 
 from flux.core.types import PolicyVersion, TrajectoryStatus
+
+if TYPE_CHECKING:
+    from flux.training.base import GPUBatch
 
 
 @dataclass
@@ -333,6 +336,46 @@ class TrajectoryBatch:
             "returns": self._returns,
             "versions": self._versions,
         }
+
+    def as_gpu_batch(
+        self,
+        device: str | torch.device = "cpu",
+        pad_token_id: int = 0,
+        current_version: int = 0,
+    ) -> "GPUBatch":
+        """Convert batch to a GPUBatch for training backends.
+
+        Args:
+            device: Target device for tensors.
+            pad_token_id: Token ID used for padding.
+            current_version: Current policy version for computing version gaps.
+
+        Returns:
+            GPUBatch with all tensors on the specified device.
+
+        Raises:
+            ValueError: If batch is empty.
+        """
+        from flux.training.base import GPUBatch
+
+        if not self.trajectories:
+            raise ValueError("Cannot create GPUBatch from empty TrajectoryBatch")
+
+        tensors = self.to_tensors(device=device, pad_token_id=pad_token_id)
+
+        # Compute version_gaps from versions and current_version
+        version_gaps = (current_version - tensors["versions"]).to(torch.long)
+
+        return GPUBatch(
+            input_ids=tensors["input_ids"],
+            attention_mask=tensors["attention_mask"],
+            behavior_log_probs=tensors["behavior_log_probs"],
+            rewards=tensors["rewards"],
+            version_gaps=version_gaps,
+            loss_mask=tensors["loss_mask"],
+            advantages=tensors["advantages"],
+            returns=tensors["returns"],
+        )
 
     def compute_padding_ratio(self) -> float:
         """Compute ratio of padding tokens."""

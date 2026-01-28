@@ -28,6 +28,15 @@ class AlgorithmType(str, Enum):
     CUSTOM = "custom"
 
 
+class TrainingBackendType(str, Enum):
+    """Supported training backend types."""
+
+    MEGATRON = "megatron"
+    FSDP = "fsdp"
+    TRANSFORMERS = "transformers"
+    DEEPSPEED = "deepspeed"
+
+
 class RewardType(str, Enum):
     """Supported reward computation types."""
 
@@ -310,6 +319,10 @@ class AlgorithmConfig(BaseConfig):
         kl_target: Target KL divergence for adaptive KL.
         adv_estimator: Override for advantage estimator registry key.
         policy_loss: Override for policy loss registry key.
+        use_importance_weighting: Enable off-policy importance correction.
+        staleness_decay: Decay factor per version gap for staleness weighting.
+        max_importance_weight: Maximum importance weight after clipping.
+        min_importance_weight: Minimum importance weight after clipping.
     """
 
     name: str = Field(default="grpo")
@@ -325,6 +338,12 @@ class AlgorithmConfig(BaseConfig):
     kl_target: float | None = Field(default=None, ge=0.0)
     adv_estimator: str | None = Field(default=None)
     policy_loss: str | None = Field(default=None)
+
+    # Importance weighting for off-policy correction
+    use_importance_weighting: bool = Field(default=True)
+    staleness_decay: float = Field(default=0.99, ge=0.0, le=1.0)
+    max_importance_weight: float = Field(default=5.0, gt=0.0)
+    min_importance_weight: float = Field(default=0.2, ge=0.0)
 
 
 class RewardConfig(BaseConfig):
@@ -383,9 +402,13 @@ class MegatronConfig(BaseConfig):
     """Configuration for Megatron training backend.
 
     Attributes:
+        use_megatron: Whether to use Megatron-LM (vs fallback PyTorch).
         tp_size: Tensor parallel size.
         pp_size: Pipeline parallel size.
         dp_size: Data parallel size.
+        micro_batch_size: Micro batch size for pipeline parallelism.
+        global_batch_size: Global batch size across all data parallel ranks.
+        seq_length: Maximum sequence length for model.
         sequence_parallel: Whether to use sequence parallelism.
         activation_checkpointing: Whether to use gradient checkpointing.
         fp16: Whether to use FP16 mixed precision.
@@ -394,9 +417,13 @@ class MegatronConfig(BaseConfig):
         accumulate_allreduce_grads_in_fp32: Accumulate gradients in FP32.
     """
 
+    use_megatron: bool = Field(default=True)
     tp_size: int = Field(default=1, ge=1)
     pp_size: int = Field(default=1, ge=1)
     dp_size: int = Field(default=1, ge=1)
+    micro_batch_size: int = Field(default=1, ge=1)
+    global_batch_size: int = Field(default=32, ge=1)
+    seq_length: int = Field(default=4096, ge=1)
     sequence_parallel: bool = Field(default=False)
     activation_checkpointing: bool = Field(default=True)
     fp16: bool = Field(default=False)
@@ -412,6 +439,25 @@ class MegatronConfig(BaseConfig):
         return self
 
 
+class CommunicationConfig(BaseConfig):
+    """Configuration for coordinator-worker communication.
+
+    Uses ZeroMQ for high-performance coordinator-worker messaging.
+    When ZMQ is unavailable, the manager operates without a backend.
+
+    Attributes:
+        use_zmq: Whether to use ZeroMQ for communication.
+        zmq_router_addr: ZeroMQ ROUTER address for request-reply.
+        zmq_pub_addr: ZeroMQ PUB address for broadcasting.
+        identity: Identity for this coordinator in the ZMQ network.
+    """
+
+    use_zmq: bool = Field(default=True, description="Enable ZeroMQ communication")
+    zmq_router_addr: str = Field(default="tcp://*:5555", description="ZMQ ROUTER address")
+    zmq_pub_addr: str = Field(default="tcp://*:5556", description="ZMQ PUB address")
+    identity: str = Field(default="coordinator", description="ZMQ identity")
+
+
 class FluxConfig(BaseConfig):
     """Main configuration for Flux trainer.
 
@@ -421,6 +467,7 @@ class FluxConfig(BaseConfig):
         model_path: Path to the model or model name.
         model_type: Type of model architecture.
         output_dir: Directory for outputs (checkpoints, logs).
+        training_backend: Training backend type (transformers, megatron, fsdp, deepspeed).
         learning_rate: Learning rate for optimizer.
         batch_size: Number of trajectories per training batch.
         gradient_accumulation_steps: Steps to accumulate gradients.
@@ -444,6 +491,7 @@ class FluxConfig(BaseConfig):
     output_dir: str = Field(default="./outputs")
 
     # Training
+    training_backend: TrainingBackendType = Field(default=TrainingBackendType.TRANSFORMERS)
     learning_rate: float = Field(default=1e-6, gt=0.0)
     batch_size: int = Field(default=32, ge=1)
     gradient_accumulation_steps: int = Field(default=4, ge=1)
@@ -478,6 +526,7 @@ class FluxConfig(BaseConfig):
     reward: RewardConfig = Field(default_factory=RewardConfig)
     sglang: SGLangConfig = Field(default_factory=SGLangConfig)
     megatron: MegatronConfig = Field(default_factory=MegatronConfig)
+    communication: CommunicationConfig = Field(default_factory=CommunicationConfig)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "FluxConfig":

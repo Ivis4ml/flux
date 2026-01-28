@@ -46,9 +46,9 @@ Sync ◄────────────────────────
 |:-------|:----:|:-----:|:-----:|:--------:|
 | Sync Strategy | Fixed sync | Fixed async | Both modes | **Adaptive** |
 | Orchestration | Ray | Custom | HTTP | **asyncio** |
-| Training Backend | Megatron/FSDP | Custom | Megatron | **Megatron** |
+| Training Backend | Megatron/FSDP | Custom | Megatron | **Pluggable** (Transformers, Megatron) |
 | Inference Backend | vLLM/SGLang | Custom | SGLang | **SGLang** |
-| Weight Sync | Ray Object Store | Custom | CUDA IPC | **CUDA IPC + NCCL** |
+| Weight Sync | Ray Object Store | Custom | CUDA IPC | **CUDA IPC + HTTP** |
 | Staleness Handling | N/A | Staleness-aware PPO | APRIL | **Unified** |
 | Code Complexity | ~15k LOC | ~25k LOC | ~8k LOC | **<5k LOC**<sup>†</sup> |
 
@@ -355,9 +355,10 @@ The framework handles staleness, importance correction, and batching automatical
 ### Prerequisites
 
 - Python 3.10+
-- CUDA 12.0+ with NCCL
-- [SGLang](https://github.com/sgl-project/sglang) server
-- [Megatron-LM](https://github.com/NVIDIA/Megatron-LM) (for distributed training)
+- CUDA 12.0+
+- [SGLang](https://github.com/sgl-project/sglang) server (for inference)
+- [Megatron-LM](https://github.com/NVIDIA/Megatron-LM) (optional, for production distributed training)
+- [HuggingFace Transformers](https://github.com/huggingface/transformers) (for development/single-GPU training)
 
 ### Install from Source
 
@@ -481,7 +482,7 @@ algorithm: grpo  # or ppo, dpo, reinforce
 | Mode | Training | Inference | Weight Sync | Recommended For |
 |:-----|:---------|:----------|:------------|:----------------|
 | **Colocated** | GPU 0-3 | GPU 4-7 | CUDA IPC | Single node, low latency |
-| **Separated** | Node A | Node B | NCCL/HTTP | Multi-node, high throughput |
+| **Separated** | Node A | Node B | HTTP | Multi-node, high throughput |
 | **Hybrid** | GPU 0-5 | GPU 6-7 + Node B | Mixed | Large-scale production |
 
 **Default recommendation**: Colocated on single node for simplicity; separated for 64+ GPU training.
@@ -516,11 +517,16 @@ flux/
 ├── controller/              # Adaptive control plane
 │   ├── adaptive_async.py   # PID-based async ratio controller
 │   ├── staleness.py        # Staleness measurement
+│   ├── mode_gate.py        # Sync/async state machine (NEW)
 │   └── importance.py       # Importance weight correction
 ├── rollout/                 # Rollout generation
 │   ├── manager.py          # Streaming rollout with APRIL
 │   └── sglang_client.py    # SGLang HTTP client
-├── training/                # Training engine
+├── training/                # Training backends
+│   ├── base.py             # TrainingBackend ABC, GPUBatch (NEW)
+│   ├── backends/           # Backend implementations (NEW)
+│   │   ├── transformers.py # HuggingFace Transformers backend
+│   │   └── __init__.py     # Backend factory
 │   ├── megatron_engine.py  # Megatron-LM integration
 │   ├── batch_composer.py   # Smart batch composition
 │   └── algorithms/         # PPO, GRPO, etc.
@@ -530,6 +536,59 @@ flux/
 └── coordinator/             # Lightweight coordinator
     └── coordinator.py      # Main asyncio coordinator
 ```
+
+### Training Backend Architecture
+
+Flux uses a **native trainer contract** that enables GPU-direct training with pluggable backends:
+
+```python
+from flux.training import TrainingBackend, GPUBatch, create_training_backend
+
+# Create backend from config (TransformersBackend, MegatronBackend, etc.)
+backend = create_training_backend(config)
+backend.initialize(training_config)
+
+# Training loop with GPU-direct batches
+for batch in trajectory_store.sample_batches():
+    gpu_batch = batch.as_gpu_batch(backend.device)
+    result = backend.train_step(gpu_batch)
+
+    if result.version % sync_interval == 0:
+        sync_weights(backend.get_state_dict())
+```
+
+| Backend | Use Case | Parallelism |
+|:--------|:---------|:------------|
+| **TransformersBackend** | Development, single/multi-GPU | DataParallel, DDP |
+| **MegatronBackend** | Production, large models | 3D (TP + PP + DP) |
+| **FSDPBackend** | Memory-efficient large models | FSDP sharding |
+
+### Mode Gate (Sync/Async State Machine)
+
+The `ModeGate` controls transitions between sync and async training modes:
+
+```
+                    ┌──────────────────┐
+                    │  ASYNC_RUNNING   │ ◄── Normal operation
+                    └────────┬─────────┘
+                             │
+            ┌────────────────┼────────────────┐
+            │                │                │
+            ▼                ▼                ▼
+    staleness > threshold    capacity = 0    buffer > 90%
+            │                │                │
+            ▼                ▼                ▼
+    ┌───────────────┐  ┌─────────────┐  ┌─────────────┐
+    │ SYNC_BARRIER  │  │  THROTTLED  │  │  THROTTLED  │
+    │ (wait for     │  │ (backpres-  │  │ (backpres-  │
+    │  in-flight)   │  │  sure)      │  │  sure)      │
+    └───────────────┘  └─────────────┘  └─────────────┘
+```
+
+The gate evaluates staleness, capacity, and buffer fill ratio to determine whether to:
+- Continue async operation
+- Trigger a sync barrier (wait for all in-flight rollouts)
+- Apply backpressure (pause new rollout submissions)
 
 ---
 

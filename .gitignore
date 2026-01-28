@@ -165,3 +165,5 @@ wandb/
 *.temp
 .temp/
 tmp/
+CLAUD.md
+.CLAUD.md

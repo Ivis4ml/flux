@@ -15,12 +15,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+#### Native Trainer Contract (v0.2 Architecture)
+- **`TrainingBackend` ABC** (`flux/training/base.py`): Abstract base class for all training backends
+  - GPU-direct assumptions: all tensors already on target device
+  - Async-safe: `train_step()` can be called from asyncio event loop
+  - Version tracking: increments after each successful train step
+- **`GPUBatch`** dataclass: Frozen, device-owned tensor batch for training
+  - Required tensors: `input_ids`, `attention_mask`, `behavior_log_probs`, `rewards`, `version_gaps`
+  - Optional tensors: `loss_mask`, `token_rewards`, `ref_log_probs`, `values`, `advantages`, `returns`
+  - Validation and device transfer methods
+- **`TrainStepResult`** dataclass: Standardized return type with loss, metrics, and timing info
+- **`create_training_backend()` factory**: Creates backend from config enum
+
+#### Training Backends
+- **`TransformersBackend`** (`flux/training/backends/transformers.py`): HuggingFace Transformers-based backend
+  - Suitable for development, single-GPU, and multi-GPU with DDP
+  - Supports Flash Attention 2, gradient checkpointing
+  - PPO-style clipped surrogate loss implementation
+  - Checkpoint save/load support
+- **`MegatronEngine` refactoring**: Now implements both `TrainingBackend` and legacy `TrainingEngine` interfaces
+  - Dual interface support for backward compatibility
+  - GPU-direct batch handling via `GPUBatch`
+  - Importance weight computation on GPU
+
+#### Mode Gate (Sync/Async State Machine)
+- **`AsyncMode`** enum: `SYNC_BARRIER`, `ASYNC_RUNNING`, `THROTTLED`
+- **`ModeGate`** class (`flux/controller/mode_gate.py`): State machine controlling sync/async transitions
+  - Priority-based state transitions (capacity > staleness > buffer fill)
+  - Hysteresis to prevent rapid oscillation
+  - Barrier enforcement with timeout
+- **`ModeGateConfig`** dataclass: Configuration for thresholds and watermarks
+- **`ModeGateState`** dataclass: Current state with reason and metrics
+- **`ModeGateIntegration`** helper: Integration with staleness manager and trajectory buffer
+
+#### Documentation
 - Initial documentation website with MkDocs Material
 - Comprehensive tutorials and how-to guides
 - API reference documentation
+- Updated architecture documentation with new components
+- Training backend and Mode Gate API documentation
 
 ### Changed
 - Reorganized documentation structure for better navigation
+- Updated `flux/training/__init__.py` with new exports
+- Updated `flux/controller/__init__.py` with ModeGate exports
 
 ### Fixed
 - Documentation links and cross-references

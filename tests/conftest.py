@@ -108,6 +108,74 @@ def device() -> torch.device:
     return torch.device("cpu")
 
 
+# ============================================================
+# Training Backend Fixtures
+# ============================================================
+
+@pytest.fixture
+def sample_gpu_batch(device: torch.device):
+    """Create a sample GPUBatch for testing."""
+    from flux.training.base import GPUBatch
+
+    batch_size = 4
+    seq_len = 16
+
+    return GPUBatch(
+        input_ids=torch.randint(0, 1000, (batch_size, seq_len), device=device),
+        attention_mask=torch.ones(batch_size, seq_len, device=device),
+        behavior_log_probs=torch.randn(batch_size, seq_len, device=device) - 2.0,
+        rewards=torch.randn(batch_size, device=device),
+        version_gaps=torch.randint(0, 5, (batch_size,), dtype=torch.long, device=device),
+        loss_mask=torch.ones(batch_size, seq_len, device=device),
+    )
+
+
+@pytest.fixture
+def sample_gpu_batch_with_advantages(device: torch.device):
+    """Create a sample GPUBatch with advantages for testing."""
+    from flux.training.base import GPUBatch
+
+    batch_size = 4
+    seq_len = 16
+
+    return GPUBatch(
+        input_ids=torch.randint(0, 1000, (batch_size, seq_len), device=device),
+        attention_mask=torch.ones(batch_size, seq_len, device=device),
+        behavior_log_probs=torch.randn(batch_size, seq_len, device=device) - 2.0,
+        rewards=torch.randn(batch_size, device=device),
+        version_gaps=torch.randint(0, 5, (batch_size,), dtype=torch.long, device=device),
+        loss_mask=torch.ones(batch_size, seq_len, device=device),
+        advantages=torch.randn(batch_size, seq_len, device=device),
+        returns=torch.randn(batch_size, seq_len, device=device),
+    )
+
+
+# ============================================================
+# Mode Gate Fixtures
+# ============================================================
+
+@pytest.fixture
+def sample_mode_gate_config():
+    """Create a sample ModeGateConfig for testing."""
+    from flux.controller.mode_gate import ModeGateConfig
+
+    return ModeGateConfig(
+        staleness_threshold=0.3,
+        capacity_low_watermark=0,
+        buffer_high_watermark=0.9,
+        min_barrier_duration_ms=0,  # Disable for faster tests
+        log_transitions=False,
+    )
+
+
+@pytest.fixture
+def sample_mode_gate(sample_mode_gate_config):
+    """Create a sample ModeGate for testing."""
+    from flux.controller.mode_gate import ModeGate
+
+    return ModeGate(config=sample_mode_gate_config)
+
+
 # Markers for test categories
 def pytest_configure(config: pytest.Config) -> None:
     """Configure custom markers."""

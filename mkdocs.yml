@@ -88,6 +88,9 @@ theme:
 plugins:
   - search:
       separator: '[\s\u200b\-_,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;|(?!\b)(?=[A-Z][a-z])'
+  # - drawio-exporter:  # Requires Draw.io desktop app installed
+  #     format: svg
+  #     sources: '*.drawio'
   # Optional plugins - uncomment after installing:
   # - minify:
   #     minify_html: true

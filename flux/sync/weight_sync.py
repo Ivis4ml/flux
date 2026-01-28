@@ -648,50 +648,141 @@ class WeightSyncManager:
             self._http_client = None
 
 
+@dataclass
+class EngineHandle:
+    """Handle for a registered inference engine.
+
+    Supports different sync protocols:
+    - ipc: Direct CUDA IPC tensor sharing (fastest, same machine)
+    - shm: Shared memory with CPU serialization
+    - callback: Custom callback function for weight updates
+    """
+
+    engine_id: str
+    protocol: str = "ipc"  # "ipc", "shm", or "callback"
+    device: int = 0  # Target CUDA device
+    shared_buffers: dict[str, torch.Tensor] = field(default_factory=dict)
+    callback: Callable[[dict[str, torch.Tensor], int], None] | None = None
+    shm_path: str | None = None  # Path for shared memory file
+
+
 class ColocatedWeightSync:
     """Weight sync for same-machine inference engines.
 
     Uses CUDA IPC for efficient GPU-to-GPU tensor transfer
-    without going through CPU memory.
+    without going through CPU memory. Falls back to CPU shared
+    memory when IPC is not available.
+
+    Sync Protocols:
+    1. **IPC (CUDA Inter-Process Communication)**:
+       - Zero-copy GPU-to-GPU transfer
+       - Requires pre-allocated shared buffers
+       - Best for same-machine, multi-process setups
+
+    2. **SHM (Shared Memory)**:
+       - CPU-based shared memory file
+       - Works across processes without CUDA IPC support
+       - Higher latency but more compatible
+
+    3. **Callback**:
+       - Custom callback for in-process weight updates
+       - Used when engine is in same process (e.g., SGLang subprocess)
 
     Example:
-        sync = ColocatedWeightSync(
-            weight_provider=model.state_dict,
-            engine_handles=[(engine_id, ipc_handle), ...],
+        sync = ColocatedWeightSync(weight_provider=model.state_dict)
+
+        # Register engine with IPC protocol
+        sync.register_engine(
+            engine_id="sglang-0",
+            protocol="ipc",
+            device=0,
         )
 
-        # Update weights
-        sync.sync_weights()
+        # Or with callback for in-process updates
+        sync.register_engine(
+            engine_id="local",
+            protocol="callback",
+            callback=engine.update_weights,
+        )
+
+        # Sync weights
+        synced = sync.sync_weights()
     """
 
     def __init__(
         self,
         weight_provider: Callable[[], dict[str, torch.Tensor]] | None = None,
         use_cuda_ipc: bool = True,
+        default_device: int = 0,
     ) -> None:
         """Initialize colocated weight sync.
 
         Args:
             weight_provider: Function returning current weights.
             use_cuda_ipc: Whether to use CUDA IPC (falls back to CPU if False).
+            default_device: Default CUDA device for new engines.
         """
         self._weight_provider = weight_provider
         self._use_cuda_ipc = use_cuda_ipc and torch.cuda.is_available()
+        self._default_device = default_device
 
         # Registered engines
-        self._engines: dict[str, Any] = {}  # engine_id -> handle
+        self._engines: dict[str, EngineHandle] = {}
 
         # Version tracking
         self._version = 0
 
-    def register_engine(self, engine_id: str, handle: Any) -> None:
+        # Shared buffer initialization state
+        self._buffers_initialized = False
+
+        # Metrics
+        self._sync_count = 0
+        self._total_bytes_synced = 0
+
+    @property
+    def version(self) -> int:
+        """Current weight version."""
+        return self._version
+
+    def register_engine(
+        self,
+        engine_id: str,
+        protocol: str = "ipc",
+        device: int | None = None,
+        callback: Callable[[dict[str, torch.Tensor], int], None] | None = None,
+        shm_path: str | None = None,
+    ) -> EngineHandle:
         """Register an inference engine for weight sync.
 
         Args:
             engine_id: Unique identifier for the engine.
-            handle: IPC handle or reference to the engine.
+            protocol: Sync protocol ("ipc", "shm", or "callback").
+            device: Target CUDA device (uses default if None).
+            callback: Callback function for "callback" protocol.
+            shm_path: Shared memory path for "shm" protocol.
+
+        Returns:
+            The created EngineHandle.
+
+        Raises:
+            ValueError: If protocol is invalid or required args missing.
         """
+        if protocol not in ("ipc", "shm", "callback"):
+            raise ValueError(f"Invalid protocol: {protocol}")
+        if protocol == "callback" and callback is None:
+            raise ValueError("callback protocol requires callback function")
+        if protocol == "shm" and shm_path is None:
+            shm_path = f"/dev/shm/flux_weights_{engine_id}"
+
+        handle = EngineHandle(
+            engine_id=engine_id,
+            protocol=protocol,
+            device=device if device is not None else self._default_device,
+            callback=callback,
+            shm_path=shm_path,
+        )
         self._engines[engine_id] = handle
+        return handle
 
     def unregister_engine(self, engine_id: str) -> None:
         """Unregister an inference engine.
@@ -699,7 +790,10 @@ class ColocatedWeightSync:
         Args:
             engine_id: Engine identifier to remove.
         """
-        self._engines.pop(engine_id, None)
+        if engine_id in self._engines:
+            handle = self._engines.pop(engine_id)
+            # Clean up shared buffers
+            handle.shared_buffers.clear()
 
     def sync_weights(self, engine_ids: list[str] | None = None) -> int:
         """Sync weights to registered engines.
@@ -726,34 +820,216 @@ class ColocatedWeightSync:
             handle = self._engines[engine_id]
 
             try:
-                if self._use_cuda_ipc:
+                if handle.protocol == "ipc" and self._use_cuda_ipc:
                     self._sync_via_ipc(handle, weights)
+                elif handle.protocol == "callback" and handle.callback is not None:
+                    self._sync_via_callback(handle, weights)
                 else:
                     self._sync_via_cpu(handle, weights)
                 synced += 1
+                self._sync_count += 1
             except Exception as e:
                 logger.error(f"Failed to sync to engine {engine_id}: {e}")
 
         return synced
 
+    def _init_shared_buffers(
+        self, handle: EngineHandle, weights: dict[str, torch.Tensor]
+    ) -> None:
+        """Initialize shared buffers for IPC sync.
+
+        Pre-allocates GPU memory that can be shared via IPC handles.
+        The inference engine can then map these buffers to its address space.
+        """
+        device = f"cuda:{handle.device}"
+
+        for name, tensor in weights.items():
+            if name not in handle.shared_buffers:
+                # Allocate contiguous buffer on target device
+                buffer = torch.empty(
+                    tensor.shape,
+                    dtype=tensor.dtype,
+                    device=device,
+                )
+                handle.shared_buffers[name] = buffer
+
     def _sync_via_ipc(
-        self, handle: Any, weights: dict[str, torch.Tensor]
+        self, handle: EngineHandle, weights: dict[str, torch.Tensor]
     ) -> None:
         """Sync weights using CUDA IPC.
 
-        Note: Actual implementation depends on engine interface.
+        Uses pre-allocated shared buffers for zero-copy transfer.
+        The inference engine reads from these buffers directly.
+
+        Args:
+            handle: Engine handle with shared buffers.
+            weights: Current model weights.
         """
-        # This is a placeholder for CUDA IPC implementation
-        # Real implementation would use torch.cuda.ipc_collect/reconstruct
-        raise NotImplementedError("CUDA IPC sync not implemented")
+        # Initialize buffers on first sync
+        if not handle.shared_buffers:
+            self._init_shared_buffers(handle, weights)
+
+        device = f"cuda:{handle.device}"
+        bytes_synced = 0
+
+        # Copy weights to shared buffers
+        for name, tensor in weights.items():
+            if name in handle.shared_buffers:
+                buffer = handle.shared_buffers[name]
+                # Ensure shapes match (may differ after model changes)
+                if buffer.shape != tensor.shape:
+                    buffer = torch.empty(
+                        tensor.shape,
+                        dtype=tensor.dtype,
+                        device=device,
+                    )
+                    handle.shared_buffers[name] = buffer
+
+                # Copy to shared buffer (non-blocking for efficiency)
+                buffer.copy_(tensor.to(device), non_blocking=True)
+                bytes_synced += tensor.numel() * tensor.element_size()
+            else:
+                # New parameter, allocate buffer
+                buffer = tensor.to(device).contiguous()
+                handle.shared_buffers[name] = buffer
+                bytes_synced += tensor.numel() * tensor.element_size()
+
+        # Synchronize to ensure copies complete
+        torch.cuda.synchronize(handle.device)
+
+        self._total_bytes_synced += bytes_synced
+        logger.debug(
+            f"IPC sync to {handle.engine_id}: {bytes_synced / 1024 / 1024:.2f} MB"
+        )
+
+    def _sync_via_callback(
+        self, handle: EngineHandle, weights: dict[str, torch.Tensor]
+    ) -> None:
+        """Sync weights via callback function.
+
+        Used for in-process weight updates where the engine
+        can directly receive the weight tensors.
+
+        Args:
+            handle: Engine handle with callback.
+            weights: Current model weights.
+        """
+        if handle.callback is None:
+            raise RuntimeError(f"No callback for engine {handle.engine_id}")
+
+        # Move weights to target device if needed
+        device_weights = {}
+
+        if torch.cuda.is_available():
+            device = f"cuda:{handle.device}"
+            for name, tensor in weights.items():
+                if tensor.device.type == "cuda" and tensor.device.index == handle.device:
+                    device_weights[name] = tensor
+                else:
+                    device_weights[name] = tensor.to(device)
+        else:
+            # CPU-only mode: just use the weights as-is
+            for name, tensor in weights.items():
+                device_weights[name] = tensor.cpu() if tensor.is_cuda else tensor
+
+        # Call the update callback with weights and version
+        handle.callback(device_weights, self._version)
+
+        logger.debug(f"Callback sync to {handle.engine_id}: version {self._version}")
 
     def _sync_via_cpu(
-        self, handle: Any, weights: dict[str, torch.Tensor]
+        self, handle: EngineHandle, weights: dict[str, torch.Tensor]
     ) -> None:
-        """Sync weights via CPU memory.
+        """Sync weights via CPU shared memory.
 
-        Note: Actual implementation depends on engine interface.
+        Serializes weights to a shared memory file that can be
+        read by other processes.
+
+        Args:
+            handle: Engine handle with shm_path.
+            weights: Current model weights.
         """
-        # This is a placeholder for CPU-based sync
-        # Real implementation would serialize and transfer
-        raise NotImplementedError("CPU sync not implemented")
+        import io
+        import os
+
+        if handle.shm_path is None:
+            handle.shm_path = f"/dev/shm/flux_weights_{handle.engine_id}"
+
+        # Serialize weights to CPU
+        cpu_weights = {k: v.detach().cpu() for k, v in weights.items()}
+
+        # Create payload with version
+        payload = {
+            "version": self._version,
+            "weights": cpu_weights,
+        }
+
+        # Serialize to bytes
+        buffer = io.BytesIO()
+        torch.save(payload, buffer)
+        data = buffer.getvalue()
+
+        # Write to shared memory file
+        # Use a temp file and atomic rename for consistency
+        tmp_path = f"{handle.shm_path}.tmp"
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+            os.replace(tmp_path, handle.shm_path)
+        except OSError:
+            # Fall back to regular file if /dev/shm not available
+            fallback_path = f"/tmp/flux_weights_{handle.engine_id}"
+            with open(fallback_path, "wb") as f:
+                f.write(data)
+            handle.shm_path = fallback_path
+            logger.warning(f"Using fallback path: {fallback_path}")
+
+        self._total_bytes_synced += len(data)
+        logger.debug(
+            f"SHM sync to {handle.engine_id}: {len(data) / 1024 / 1024:.2f} MB"
+        )
+
+    def get_ipc_handles(
+        self, engine_id: str
+    ) -> dict[str, Any] | None:
+        """Get IPC handles for an engine's shared buffers.
+
+        The inference engine can use these handles to map the
+        shared GPU memory to its address space.
+
+        Args:
+            engine_id: Engine identifier.
+
+        Returns:
+            Dict of parameter name to IPC handle, or None if not found.
+        """
+        from flux.sync.cuda_ipc import get_ipc_handle
+
+        if engine_id not in self._engines:
+            return None
+
+        handle = self._engines[engine_id]
+        if not handle.shared_buffers:
+            return None
+
+        ipc_handles = {}
+        for name, tensor in handle.shared_buffers.items():
+            if tensor.is_cuda and tensor.is_contiguous():
+                ipc_handles[name] = get_ipc_handle(tensor)
+
+        return ipc_handles
+
+    def get_metrics(self) -> dict[str, Any]:
+        """Get sync metrics.
+
+        Returns:
+            Dict with sync statistics.
+        """
+        return {
+            "version": self._version,
+            "sync_count": self._sync_count,
+            "total_bytes_synced": self._total_bytes_synced,
+            "total_mb_synced": self._total_bytes_synced / 1024 / 1024,
+            "num_engines": len(self._engines),
+            "use_cuda_ipc": self._use_cuda_ipc,
+        }
